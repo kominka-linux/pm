@@ -1,0 +1,2701 @@
+#!/usr/local/bin/ysh
+
+# Environment variables — imported from ENV in main().
+var HOME = ''
+var LOGNAME = ''
+var PATH = ''
+var PWD = ''
+var OLDPWD = ''
+var XDG_CACHE_HOME = ''
+var KOMINKA_ROOT = ''
+var KOMINKA_PATH = ''
+var KOMINKA_COLOR = ''
+var KOMINKA_PROMPT = ''
+var KOMINKA_COMPRESS = ''
+var KOMINKA_PID = ''
+var KOMINKA_FORCE = ''
+var KOMINKA_CHOICE = ''
+var KOMINKA_DEBUG = ''
+var KOMINKA_STRIP = ''
+var KOMINKA_INSECURE = ''
+var KOMINKA_HOOK = ''
+var KOMINKA_TMPDIR = ''
+var KOMINKA_KEEPLOG = ''
+var KOMINKA_SU = ''
+var KOMINKA_ELF = ''
+var KOMINKA_CHK = ''
+var KOMINKA_GET = ''
+var KOMINKA_MIRROR = ''
+var KOMINKA_BIN_MIRROR = ''
+var KOMINKA_REPO = ''
+var KOMINKA_TOKEN = ''
+var KOMINKA_ARCH = ''
+var _KOMINKA_LVL = 0
+var CC = ''
+var CXX = ''
+var DESTDIR = ''
+var GOPATH = ''
+var GOFLAGS = ''
+
+# Global state — colors, paths, discovered tools.
+var c1 = ''
+var c2 = ''
+var c3 = ''
+
+var ppwd = ''
+var newline = \n
+
+var cmd_su = ''
+var cmd_elf = ''
+var cmd_sha = ''
+var cmd_get = ''
+
+var sys_db = ''
+var sys_ch = ''
+var sys_arch = ''
+var pkg_db = ''
+var cho_db = ''
+
+var cac_dir = ''
+var src_dir = ''
+var log_dir = ''
+var bin_dir = ''
+
+var proc_dir = ''
+var mak_dir = ''
+var pkg_dir = ''
+var tar_dir = ''
+var tmp_dir = ''
+
+var time_str = ''
+
+# pkg_find sets repo_dir as its output; pkg_load reads it and stores p.dir.
+var repo_dir = ''
+
+# PKGBUILD.ysh parse fallbacks — used when a PKGBUILD.ysh does not declare
+# the optional field; the global value is read as the default.
+var nostrip           = false
+var checksums_aarch64 = []
+var checksums_x86_64  = []
+
+# Temp file stack — access via tf[-1] (newest), tf[-2], tf[-3].
+var tf = []
+
+# Source resolution state.
+var _res = ''
+var _des = ''
+var _fnr_val = ''
+var _rpath = ''
+var _owns = ''
+var oct = ''
+
+# Build / install state.
+var tar_file = ''
+var hash = ''
+var build_install = '1'
+var prefer_cache = ''
+var user = ''
+var _file = ''
+# Name of the package currently being installed (string, not the _pkg dict).
+var _install_pkg_name = ''
+
+# Runtime configuration dict — set in main(), read throughout.
+var config = {}
+
+# Dependency / ordering state.
+# Lists preserve insertion order; companion dicts give O(1) membership.
+var deps = []
+var deps_seen = {}
+var explicit = []
+var explicit_seen = {}
+var explicit_build = {}
+var order = []
+var redro = []
+var repos_seen = {}
+
+# Remote package index (populated by index_load from cached packages.json).
+var _remote_index = {}
+var _remote_loaded = false
+
+proc log (name, msg='', prefix='->') {
+    ### Log a message to stderr with optional coloring.
+    if (msg !== '') {
+        write -- "${c1}${prefix} ${c2}${name}${c3} ${msg}" >&2
+    } else {
+        write -- "${c1}${prefix} ${c3}${name}" >&2
+    }
+}
+
+proc war (name, msg='', prefix='WARNING') {
+    log $name $msg $prefix
+}
+
+proc die (name, msg='', prefix='ERROR') {
+    log $name $msg $prefix
+    exit 1
+}
+
+proc run (...args) {
+    ### Print the command, then run it.
+    write -- @args
+    @args
+}
+
+func contains(list, item) {
+    ### Check if a List contains an item (for non-set lists).
+    for x in (list) {
+        if (x === item) {
+            return (true)
+        }
+    }
+    return (false)
+}
+
+proc tmp_file (name, suffix) {
+    ### Create a uniquely named temporary file, appending to the stack.
+    var f = "${tmp_dir}/${name}-${suffix}"
+    true > $f || die $name "Failed to create temporary file"
+    call tf->append(f)
+}
+
+proc tmp_file_copy (name, suffix, src) {
+    ### Create a temp file and copy src into it if it exists.
+    tmp_file $name $suffix
+    if test -f $src {
+        cp -f $src $[tf[-1]]
+    }
+}
+
+proc prompt (msg='') {
+    if (KOMINKA_PROMPT === '0') { return }
+
+    if (msg !== '') {
+        log $msg
+    }
+    log "Continue?: Press Enter to continue or Ctrl+C to abort"
+    read --raw-line || exit 1
+}
+
+proc mkcd (...dirs) {
+    mkdir -p @dirs && cd $[dirs[0]]
+}
+
+proc _fnr_step (old, new) {
+    ### Replace all occurrences of old with new in _fnr_val.
+    while (true) {
+        case (_fnr_val) {
+            *$old* {
+                setglobal _fnr_val = "${_fnr_val%$old*}${new}${_fnr_val##*$old}"
+            }
+            (else) { break }
+        }
+    }
+}
+
+proc fnr (input, ...pairs) {
+    ### Replace all occurrences of substrings with substrings.
+    # Takes an input string followed by pairs of (old, new) arguments.
+    setglobal _fnr_val = input
+    var i = 0
+    while (i < len(pairs) - 1) {
+        _fnr_step $[pairs[i]] $[pairs[i + 1]]
+        setvar i = i + 2
+    }
+}
+
+proc fnr_vars (input; p Dict) {
+    ### Substitute VERSION/RELEASE/MAJOR/MINOR/PATCH/IDENT/PACKAGE in a source line.
+    # For each keyword: protect \KEYWORD → sentinel, replace KEYWORD → value, restore.
+    setglobal _fnr_val = input
+    # ARCH: GNU name (aarch64, x86_64). GOARCH: Go/kernel name (arm64, amd64).
+    var _arch = ${sys_arch%%-*}
+    var _goarch = _arch
+    case (_arch) {
+        aarch64 { setvar _goarch = 'arm64' }
+        x86_64  { setvar _goarch = 'amd64' }
+    }
+
+    # Split version into components for MAJOR/MINOR/PATCH/IDENT substitution.
+    var _vp = p.ver => split(/ '.' | '+' | '-' | '_' /)
+
+    var subs = {
+        VERSION: p.ver, RELEASE: p.rel,
+        MAJOR: _vp[0] if (len(_vp) > 0) else '',
+        MINOR: _vp[1] if (len(_vp) > 1) else '',
+        PATCH: _vp[2] if (len(_vp) > 2) else '',
+        IDENT: _vp[3] if (len(_vp) > 3) else '',
+        PACKAGE: p.name,
+        GOARCH: _goarch, ARCH: _arch,
+    }
+    for key, val in (subs) {
+        _fnr_step "\\\\$key" ' '
+        _fnr_step $key $val
+        _fnr_step ' ' $key
+    }
+}
+
+proc am_owner (path) {
+    ### Check if the current user owns a path.
+    var inf = ''
+    try { setvar inf = $(ls -ld $path) }
+    if failed { die "Failed to get file info for '$path'" }
+
+    read --raw-line (&line) <<< $inf
+    var fields = line => split(/ ' '+ /)
+    setglobal user = fields[2]
+
+    if (LOGNAME !== user) {
+        return 1
+    }
+}
+
+proc as_user (...args) {
+    write -- "Using '${cmd_su}' (to become ${user})"
+
+    case (cmd_su) {
+        */su { $cmd_su -c "$[args => join(' ')] <&3" $user 3<&0 </dev/tty }
+        *    { $cmd_su -u $user -- @args }
+    }
+}
+
+proc pkg_owner (...args) {
+    ### Find which package owns a file by searching manifests.
+    if (len(args) < 2) {
+        var manifests = @[glob("${sys_db}/*/manifest")]
+        setvar args = [args[0]]
+        call args->extend(manifests)
+    }
+
+    try { setglobal _owns = $(grep -lxF @args) }
+    if failed { setglobal _owns = '' }
+    setglobal _owns = ${_owns%/*}
+    setglobal _owns = ${_owns##*/}
+
+    if (_owns === '') {
+        return 1
+    }
+}
+
+proc resolve_path (path) {
+    var rpath = "${KOMINKA_ROOT}/${path#/}"
+
+    if cd -P "${rpath%/*}" 2>/dev/null {
+        var parent = PWD
+        cd $OLDPWD
+    } else {
+        setvar parent = ${rpath%/*}
+    }
+
+    setglobal _rpath = "${parent#"$KOMINKA_ROOT"}/${rpath##*/}"
+}
+
+proc run_hook (hook_name, ...args) {
+    ### Run all hooks in KOMINKA_HOOK (colon-separated list of file paths).
+    if (KOMINKA_HOOK === '') { return }
+
+    for hook in (KOMINKA_HOOK => split(':')) {
+        if (hook !== '') {
+            try { $hook @args }
+            if failed { die "$hook_name hook failed: '$hook'" }
+        }
+    }
+}
+
+proc run_hook_pkg (hook_name, pkg_name) {
+    ### Run a hook from the package's database files.
+    if test -x "${sys_db}/${pkg_name}/${hook_name}" {
+        log $pkg_name "Running $hook_name hook"
+        "${sys_db}/${pkg_name}/${hook_name}" \
+            || war $pkg_name "$hook_name hook failed (exit=$?)"
+
+    } elif test -f "${sys_db}/${pkg_name}/${hook_name}" {
+        war $pkg_name "skipping $hook_name hook: not executable"
+    }
+}
+
+proc decompress (file) {
+    case (file) {
+        *.tbz | *.bz2 { bzip2 -d }
+        *.lzma         { lzma -dc }
+        *.lz           { lzip -dc }
+        *.tar          { cat }
+        *.tgz | *.gz   { gzip -d }
+        *.xz | *.txz   { xz -dc }
+        *.zst          { zstd -dc }
+    } < $file
+}
+
+proc sh256 (...files) {
+    ### Higher level sha256 — filters out non-existent files and directories.
+    var real_files = []
+    for f in (files) {
+        if ! test -d $f && test -e $f {
+            call real_files->append(f)
+        }
+    }
+    _sh256 @real_files
+}
+
+proc _sh256 (...files) {
+    ### Generate sha256 checksums using whatever utility is available.
+    # Output matches sha256sum format: '<checksum>  <file>'
+    setglobal hash = ''
+
+    if (len(files) === 0) {
+        return
+    }
+
+    var sha_args = []
+    case (cmd_sha) {
+        */openssl { setvar sha_args = :| dgst -sha256 -r | }
+        */sha256  { setvar sha_args = :| -r | }
+        */shasum  { setvar sha_args = :| -a 256 | }
+        */digest  { setvar sha_args = :| -a sha256 | }
+    }
+
+    var raw = ''
+    try { setvar raw = $($cmd_sha @sha_args @files) }
+    if failed { die "Failed to generate checksums" }
+
+    var result = []
+    for line in @(echo $raw) {
+        call result->append(${line%% *})
+    }
+
+    setglobal hash = $[result => join(\n)]
+    write -- $hash
+}
+
+proc _download (dest, url) {
+    ### Download a URL to a local file. Returns 1 on failure.
+    case (cmd_get) {
+        */curl {
+            if (KOMINKA_INSECURE === '1') {
+                try { $cmd_get -ksfLo $dest $url }
+            } else {
+                try { $cmd_get -sfLo $dest $url }
+            }
+        }
+        */wget {
+            try { $cmd_get --no-check-certificate -qO $dest $url }
+        }
+    }
+    if failed { rm -f $dest; return 1 }
+}
+
+proc index_load () {
+    ### Load the cached remote package index into _remote_index.
+    if (_remote_loaded) { return }
+    var idx_file = "${cac_dir}/packages.json"
+    if ! test -f $idx_file { return }
+    json read < $idx_file
+    setglobal _remote_index = _reply["packages"]
+    setglobal _remote_loaded = true
+}
+
+proc index_refresh () {
+    ### Download the remote package index.
+    if (KOMINKA_REPO === '') { return }
+    var idx_url = "${KOMINKA_REPO}/${sys_arch}/packages.json"
+    var idx_file = "${cac_dir}/packages.json"
+    log "Fetching package index"
+    try { _download $idx_file $idx_url }
+    if failed {
+        war "index" "Failed to fetch remote index"
+        return
+    }
+    setglobal _remote_loaded = false
+}
+
+proc auth_token_load (; result Ref) {
+    ### Load the bearer token for repository uploads.
+    # 1. KOMINKA_TOKEN env var (for CI).
+    if (KOMINKA_TOKEN !== '') {
+        call result->setValue(KOMINKA_TOKEN)
+        return
+    }
+    # 2. macOS Keychain.
+    var _t = ''
+    try { setvar _t = $(security find-generic-password -s kominka-repo -w 2>/dev/null) }
+    if (_t !== '') { call result->setValue(_t); return }
+    # 3. File fallback.
+    var _tf = "${HOME}/.config/kominka/token"
+    if test -f $_tf {
+        read -r _t < $_tf
+        call result->setValue(_t)
+        return
+    }
+    call result->setValue('')
+}
+
+proc auth_token_store (token) {
+    ### Store the bearer token for repository uploads.
+    # macOS Keychain.
+    try { security add-generic-password -U -s kominka-repo -a kominka -w $token 2>/dev/null }
+    if ! failed { return }
+    # File fallback.
+    var _dir = "${HOME}/.config/kominka"
+    mkdir -p $_dir
+    chmod 700 $_dir
+    write -- $token > "${_dir}/token"
+    chmod 600 "${_dir}/token"
+}
+
+proc pm_auth () {
+    ### Store a repository authentication token.
+    # V1: prompts for a token and stores it. V2 will add browser passkey flow.
+    if (KOMINKA_REPO === '') { die "KOMINKA_REPO not set" }
+
+    log "Enter your API token for ${KOMINKA_REPO}:"
+    read -r _token
+    if (_token === '') { die "Empty token" }
+
+    auth_token_store $_token
+    log "Token stored"
+}
+
+proc pkg_load (pkg_dir; result Ref = null) {
+    ### Load a package from pkg_dir into a dict and return it via out-param.
+    # Supports both PKGBUILD.ysh (repo packages) and version/depends files
+    # (installed db entries).
+    var d = {}
+    if test -f "${pkg_dir}/PKGBUILD.ysh" {
+        # Declare required fields as locals so stale values don't leak if
+        # PKGBUILD.ysh somehow omits them. Optional fields (nostrip,
+        # checksums_aarch64, checksums_x86_64) fall back to the globals
+        # declared at the top of this file when PKGBUILD.ysh omits them.
+        var name = ${pkg_dir##*/}
+        var ver  = ''
+        var rel  = ''
+        var deps    = []
+        var mkdeps  = []
+        var sources   = []
+        var checksums = []
+
+        source "${pkg_dir}/PKGBUILD.ysh"
+
+        setvar d = {
+            dir:              pkg_dir,
+            name:             name,
+            ver:              ver,
+            rel:              rel,
+            deps:             deps,
+            mkdeps:           mkdeps,
+            nostrip:          nostrip,
+            sources:          sources,
+            checksums:        checksums,
+            checksums_aarch64: checksums_aarch64,
+            checksums_x86_64:  checksums_x86_64,
+        }
+    } elif test -f "${pkg_dir}/version" {
+        # Installed db entry — read old-format files.
+        var _vline = ''
+        read -r _vline < "${pkg_dir}/version"
+        var _vparts = _vline => split(" ")
+        var _ver = _vparts[0]
+        var _rel = _vparts[1] if (len(_vparts) > 1) else ''
+
+        var _deps   = []
+        var _mkdeps = []
+        if test -f "${pkg_dir}/depends" {
+            while true {
+                try { read -r _dep _dtype }
+                if (_dep === '' and _status !== 0) { break }
+                if (_dtype === 'make') {
+                    call _mkdeps->append(_dep)
+                } else {
+                    call _deps->append(_dep)
+                }
+            } < "${pkg_dir}/depends"
+        }
+
+        setvar d = {
+            dir:              pkg_dir,
+            name:             ${pkg_dir##*/},
+            ver:              _ver,
+            rel:              _rel,
+            deps:             _deps,
+            mkdeps:           _mkdeps,
+            nostrip:          false,
+            sources:          [],
+            checksums:        [],
+            checksums_aarch64: [],
+            checksums_x86_64:  [],
+        }
+    } elif (pkg_dir => startsWith('remote:')) {
+        # Remote index entry — no filesystem, metadata from cached index.
+        var _rname = ${pkg_dir#remote:}
+        index_load
+        if (not (_rname in _remote_index)) {
+            die $_rname "Not in remote index"
+        }
+        var _ri = _remote_index[_rname]
+        setvar d = {
+            dir:              pkg_dir,
+            name:             _rname,
+            ver:              _ri["ver"],
+            rel:              _ri["rel"],
+            deps:             _ri["deps"],
+            mkdeps:           _ri["mkdeps"] if ("mkdeps" in _ri) else [],
+            nostrip:          false,
+            sources:          [],
+            checksums:        [],
+            checksums_aarch64: [],
+            checksums_x86_64:  [],
+            sha256:           _ri["sha256"] if ("sha256" in _ri) else '',
+        }
+    } else {
+        die "${pkg_dir##*/}" "No PKGBUILD.ysh or version file in $pkg_dir"
+    }
+
+    # Keep repo_dir in sync — callers use `pkg_load $repo_dir (&p)` where
+    # repo_dir was just set by _pkg_find; this ensures p.dir === repo_dir.
+    setglobal repo_dir = d.dir
+
+    if (result !== null) { call result->setValue(d) }
+}
+
+proc pkg_find (name, mode='', test_flag='', search_path='') {
+    try { _pkg_find $name $mode $test_flag $search_path }
+    if failed { die "'$name' not found" }
+}
+
+proc pkg_find_and_load (pkg; result Ref) {
+    ### Find a package and load it into a dict returned via out-param.
+    pkg_find $pkg
+    pkg_load $repo_dir (result)
+}
+
+proc _pkg_find (name, mode='', test_flag='', search_path='') {
+    ### Search KOMINKA_PATH for directories matching a package name.
+    var spath = search_path if (search_path !== '') else KOMINKA_PATH
+    var flag = test_flag if (test_flag !== '') else '-d'
+    var results = []
+
+    var paths = spath => split(':')
+
+    # Append sys_db as fallback unless a custom test flag was given.
+    if (test_flag === '') {
+        call paths->append(sys_db)
+    }
+
+    for find_path in (paths) {
+        for find_pkg in @[glob("${find_path}/${name}")] {
+            if test $flag $find_pkg {
+                call results->append(find_pkg)
+            }
+        }
+    }
+
+    if (len(results) === 0) {
+        # Remote index fallback (only for default package search).
+        if (test_flag === '' and mode === '' and KOMINKA_REPO !== '') {
+            index_load
+            if (name in _remote_index) {
+                setglobal repo_dir = "remote:${name}"
+                return 0
+            }
+        }
+        return 1
+    }
+
+    if (mode === '') {
+        setglobal repo_dir = results[0]
+    } else {
+        for r in (results) {
+            write -- $r
+        }
+    }
+}
+
+### ── Database abstraction ─────────────────────────────────────────────── ###
+# These procs encapsulate all access to sys_db (the installed package DB).
+# Use these instead of directly accessing sys_db paths.
+
+proc db_installed (name) {
+    ### Return 0 if package is installed, 1 otherwise.
+    test -d "${sys_db}/${name}"
+}
+
+proc db_version (name) {
+    ### Print "ver rel" of installed package, or die if not installed.
+    if ! test -f "${sys_db}/${name}/version" {
+        die $name "Not installed"
+    }
+    cat "${sys_db}/${name}/version"
+}
+
+proc db_register (name, ver, rel) {
+    ### Create a minimal DB entry for a metapackage or pre-registered package.
+    mkdir -p "${sys_db}/${name}"
+    write -- "$ver $rel" > "${sys_db}/${name}/version"
+    printf '#!/bin/sh\n:\n' > "${sys_db}/${name}/build"
+    chmod +x "${sys_db}/${name}/build"
+    true > "${sys_db}/${name}/manifest"
+}
+
+proc db_remove (name) {
+    ### Remove a package's DB entry.
+    rm -rf "${sys_db}/${name}"
+}
+
+proc db_all_installed () {
+    ### Print all installed package names, one per line.
+    for d in @[glob("${sys_db}/*")] {
+        write -- ${d##*/}
+    }
+}
+
+proc db_dependents (name) {
+    ### Print installed packages that depend on name, one per line.
+    cd $sys_db
+    try { grep -lFx -- $name */depends }
+    cd $OLDPWD
+}
+
+proc pkg_list_version (...pkgs) {
+    ### List installed packages with their versions.
+    if (len(pkgs) === 0) {
+        setvar pkgs = @[glob("${sys_db}/*")]
+    }
+
+    var p = null
+    for list_pkg in (pkgs) {
+        pkg_find "${list_pkg##*/}" '' '' $sys_db
+        pkg_load $repo_dir (&p)
+        write -- "$[p.name] $[p.ver]-$[p.rel]"
+    }
+}
+
+proc pkg_info (pkg) {
+    ### Show name, version, deps, and install status for a package.
+    var p = null
+    pkg_find_and_load $pkg (&p)
+
+    var status = 'not installed'
+    if test -d "${sys_db}/$[p.name]" { setvar status = 'installed' }
+
+    write -- "name     $[p.name]"
+    write -- "version  $[p.ver]-$[p.rel]"
+    write -- "status   $status"
+
+    if (len(p.deps) > 0) {
+        write -- "deps     $[p.deps => join(' ')]"
+    }
+    if (len(p.mkdeps) > 0) {
+        write -- "mkdeps   $[p.mkdeps => join(' ')]"
+    }
+    if (len(p.sources) > 0) {
+        write -- "sources  $[p.sources => join(' ')]"
+    }
+}
+
+proc pkg_upload (pkg) {
+    ### Upload a built package tarball to the repository server.
+    # Accepts either a package name (looks in bin cache) or a tarball path.
+    if (KOMINKA_REPO === '') { die "KOMINKA_REPO not set" }
+
+    var _token = ''
+    auth_token_load (&_token)
+    if (_token === '') { die "Not authenticated — set KOMINKA_TOKEN or run 'pm auth'" }
+
+    case (cmd_get) {
+        */curl { true }
+        * { die "Upload requires curl" }
+    }
+
+    var _tarball = ''
+    var _pkg = ''
+    var _p = null
+
+    case (pkg) {
+        *.tar.* {
+            if ! test -f $pkg { die "File '$pkg' does not exist" }
+            setvar _tarball = pkg
+            var _base = ${pkg##*/}
+            setvar _pkg = ${_base%%@*}
+            pkg_find_and_load $_pkg (&_p)
+        }
+        * {
+            pkg_find_and_load $pkg (&_p)
+            setvar _pkg = pkg
+
+            # Metapackage: publish metadata only.
+            if (len(_p.sources) === 0) {
+                var _deps_json = _p.deps => join('","')
+                if (_deps_json !== '') { setvar _deps_json = "\"${_deps_json}\"" }
+                var _mkdeps_json = _p.mkdeps => join('","')
+                if (_mkdeps_json !== '') { setvar _mkdeps_json = "\"${_mkdeps_json}\"" }
+                $cmd_get -sf -X POST "${KOMINKA_REPO}/api/publish" \
+                    -H "Authorization: Bearer ${_token}" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"arch\":\"${sys_arch}\",\"pkg\":\"${_pkg}\",\"ver\":\"$[_p.ver]\",\"rel\":\"$[_p.rel]\",\"deps\":[${_deps_json}],\"mkdeps\":[${_mkdeps_json}]}" \
+                    || die $_pkg "Publish failed"
+                log $_pkg "Published metapackage"
+                return
+            }
+
+            setvar _tarball = "${bin_dir}/${pkg}@$[_p.ver]-$[_p.rel].tar.${KOMINKA_COMPRESS}"
+            if ! test -f $_tarball {
+                for f in @[glob("${bin_dir}/${pkg}@$[_p.ver]-$[_p.rel].tar.*")] {
+                    setvar _tarball = f
+                }
+            }
+            if ! test -f $_tarball {
+                die $pkg "No tarball found — build it first"
+            }
+        }
+    }
+
+    var _deps_header = _p.deps => join(',')
+    var _mkdeps_header = _p.mkdeps => join(',')
+
+    log $_pkg "Uploading ${_tarball##*/}"
+    $cmd_get -sf -X POST "${KOMINKA_REPO}/api/upload" \
+        -H "Authorization: Bearer ${_token}" \
+        -H "X-Arch: ${sys_arch}" \
+        -H "X-Pkg: ${_pkg}" \
+        -H "X-Ver: $[_p.ver]" \
+        -H "X-Rel: $[_p.rel]" \
+        -H "X-Deps: ${_deps_header}" \
+        -H "X-Mkdeps: ${_mkdeps_header}" \
+        --data-binary "@${_tarball}" \
+        || die $_pkg "Upload failed"
+    log $_pkg "Uploaded"
+}
+
+proc pkg_cache (pkg) {
+    ### Find the tarball of a package in the binary cache.
+    var p = null
+    pkg_find_and_load $pkg (&p)
+
+    setglobal tar_file = "${bin_dir}/${pkg}@$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+
+    if test -f $tar_file { return 0 }
+
+    for f in @[glob("${bin_dir}/${pkg}@$[p.ver]-$[p.rel].tar.*")] {
+        setglobal tar_file = f
+        return 0
+    }
+
+    # Metapackages have no tarball. For remote-index packages, sha256 is the
+    # authoritative signal — non-empty sha256 means a real tarball exists even
+    # though sources=[] (remote index never stores sources).
+    if (len(p.sources) === 0 and ('sha256' not in p or p.sha256 === '')) { return 1 }
+
+    # Try repo server: {arch}/{pkg}/{ver}-{rel}.tar.gz
+    if (KOMINKA_REPO !== '') {
+        var _remote_name = "$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+        var _remote_url = "${KOMINKA_REPO}/${sys_arch}/${pkg}/${_remote_name}"
+        setglobal tar_file = "${bin_dir}/${pkg}@$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+        try { _download $tar_file $_remote_url }
+        if ! failed { return 0 }
+    }
+
+    # Fallback: legacy binary mirror.
+    if (KOMINKA_BIN_MIRROR !== '') {
+        setvar _remote_name = "$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+        setvar _remote_url = "${KOMINKA_BIN_MIRROR}/${sys_arch}/${pkg}/${_remote_name}"
+        setglobal tar_file = "${bin_dir}/${pkg}@$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+        try { _download $tar_file $_remote_url }
+        if ! failed { return 0 }
+    }
+
+    return 1
+}
+
+proc _resolve_found (quiet) {
+    ### Print resolution result unless in quiet/checksum mode.
+    if (quiet === '') { write -- "found $_res" }
+}
+
+proc pkg_source_resolve (src, dest='', quiet=''; p Dict) {
+    ### Resolve a source line to an absolute path.
+    setglobal _res = ''
+    setglobal _des = ''
+    setglobal _fnr_val = ''
+    # Skip comments.
+    case (src) {
+        \#* { return }
+    }
+
+    var clean_src = ${src%"${src##*[!/]}"}
+
+    fnr_vars $clean_src (p)
+
+    var resolved_src = _fnr_val
+    var clean_dest = ${dest%"${dest##*[!/]}"}
+
+    # Git repository.
+    if (resolved_src => startsWith('git+')) {
+        setglobal _res = resolved_src
+        var base = ${resolved_src##*/}
+        setvar base = ${base%[@#]*}
+        setglobal _des = "${src_dir}/$[p.name]/${clean_dest:+"${clean_dest}/"}${base}/"
+        _resolve_found $quiet
+        return
+    }
+
+    # Remote source (cached).
+    var cached = "${src_dir}/$[p.name]/${clean_dest:+"${clean_dest}/"}${resolved_src##*/}"
+    if test -f $cached {
+        setglobal _res = cached
+        _resolve_found $quiet
+        return
+    }
+
+    # Remote source (not yet downloaded).
+    case (resolved_src) {
+        *://* {
+            setglobal _res = "url+${resolved_src}"
+            setglobal _des = cached
+            _resolve_found $quiet
+            return
+        }
+    }
+
+    # Local relative directory.
+    if test -d "$[p.dir]/${resolved_src}" {
+        setglobal _res = "$[p.dir]/${resolved_src}/."
+        _resolve_found $quiet
+        return
+    }
+
+    # Local absolute directory.
+    if test -d "/${resolved_src##/}" {
+        setglobal _res = "/${resolved_src##/}/."
+        _resolve_found $quiet
+        return
+    }
+
+    # Local relative file.
+    if test -f "$[p.dir]/${resolved_src}" {
+        setglobal _res = "$[p.dir]/${resolved_src}"
+        _resolve_found $quiet
+        return
+    }
+
+    # Local absolute file.
+    if test -f "/${resolved_src##/}" {
+        setglobal _res = "/${resolved_src##/}"
+        _resolve_found $quiet
+        return
+    }
+
+    die $[p.name] "No local file '$resolved_src'"
+}
+
+proc pkg_source (checksum_mode=''; p Dict) {
+    ### Download any remote package sources.
+
+    # Support packages without sources.
+    if (len(p.sources) === 0) { return }
+
+    log $[p.name] "Reading sources"
+
+    for src_line in (p.sources) {
+        var src  = ${src_line%% *}
+        var dest = ''
+        if (src_line !== src) { setvar dest = ${src_line#* } }
+
+        pkg_source_resolve $src $dest $checksum_mode (p)
+
+        run_hook pre-source $[p.name] $src $_fnr_val
+
+        # Download remote or clone git sources.
+        var src_key = "${checksum_mode}${_res}"
+        case (src_key) {
+            *url+* | git+* {
+                mkcd "${_des%/*}"
+                var src_type = ${_res%%+*}
+                var src_prefix = "${src_type}+"
+                var src_url = ${_res##$src_prefix}
+
+                if (src_type === 'url' and KOMINKA_MIRROR !== '') {
+                    var mirror_file = ${src_url##*/}
+                    var mirror_url = "${KOMINKA_MIRROR}/$[p.name]/${mirror_file}"
+                    try { pkg_source_url $_des $mirror_url 'n' (p) }
+                    if ! failed { continue }
+                    war $[p.name] "Mirror unavailable, trying upstream"
+                }
+
+                "pkg_source_${src_type}" $_des $src_url (p)
+            }
+        }
+
+        run_hook post-source $[p.name] $src "${_des:-"$_res"}"
+    }
+}
+
+proc pkg_source_url (dest, url, fatal='y'; p Dict) {
+    log $[p.name] "Downloading $url"
+
+    case (cmd_get) {
+        */curl {
+            var curl_args = ['-fLo', dest, url]
+            if (KOMINKA_INSECURE === '1') { setvar curl_args = ['-kfLo', dest, url] }
+            try { $cmd_get @curl_args }
+        }
+        */wget {
+            # busybox wget does not implement TLS certificate validation;
+            # --no-check-certificate is required for any HTTPS download.
+            try { $cmd_get --no-check-certificate -qO $dest $url }
+        }
+    }
+    if failed {
+        rm -f $dest
+        if (fatal === 'y') {
+            die $[p.name] "Failed to download $url"
+        }
+        return 1
+    }
+}
+
+proc pkg_source_git (dest, url; p Dict) {
+    var com = ${url##*[@#]}
+    setvar com = ${com#${url%[#@]*}}
+
+    log $[p.name] "Checking out ${com:-FETCH_HEAD}"
+
+    if ! test -d .git {
+        git init
+    }
+
+    git remote set-url origin "${url%[#@]*}" 2>/dev/null \
+        || git remote add origin "${url%[#@]*}"
+
+    # Partial clone (--filter + --depth) avoids downloading full history.
+    # Some servers (e.g. Googlesource) reject these options, so fall back.
+    var fetch_args = ['--depth=1', '--filter=blob:none', 'origin']
+    if (com !== '') { call fetch_args->append(com) }
+
+    try { git fetch @fetch_args }
+    if failed {
+        war $[p.name] "Partial clone rejected, retrying full fetch"
+        var fallback = ['origin']
+        if (com !== '') { call fallback->append(com) }
+        git fetch @fallback
+    }
+    git reset --hard FETCH_HEAD
+}
+
+proc pkg_source_tar (file; p Dict) {
+    ### Portable --strip-components 1 for tar extraction.
+    tmp_file $[p.name] tarball
+    tmp_file $[p.name] tarball-manifest
+
+    try { decompress $file > $[tf[-2]] }
+    if failed { die $[p.name] "Failed to decompress $file" }
+
+    try { tar xf $[tf[-2]] }
+    if failed { die $[p.name] "Failed to extract $file" }
+
+    # Get unique top-level directories.
+    try { tar tf $[tf[-2]] | sort -ut / -k1,1 > $[tf[-1]] }
+    if failed { die $[p.name] "Failed to extract manifest" }
+
+    while read --raw-line {
+        var _parts = _reply => split('/')
+        var dir = _parts[0]
+        var dir_stripped = ${dir#.}
+        case (dir_stripped) {
+            ?* {
+                if ! test -d $dir { continue }
+
+                mv -f $dir "${KOMINKA_PID}-${dir}"
+
+                find "${KOMINKA_PID}-${dir}/." ! -name . -prune \
+                    -exec sh -c 'mv -f "$0" "$@" .' {} + 2>/dev/null \
+                || find "${KOMINKA_PID}-${dir}/." ! -name . -prune \
+                    -exec sh -c 'cp -fRp "$0" "$@" .' {} +
+
+                rm -rf "${KOMINKA_PID}-${dir}"
+            }
+        }
+    } < $[tf[-1]]
+
+    rm -f $[tf[-2]]
+}
+
+proc pkg_extract (; p Dict) {
+    ### Extract all source archives to the build directory.
+    log $[p.name] "Extracting sources"
+
+    run_hook pre-extract $[p.name] "${pkg_dir}/$[p.name]"
+
+    for src_line in (p.sources) {
+        var src  = ${src_line%% *}
+        var dest = ''
+        if (src_line !== src) { setvar dest = ${src_line#* } }
+
+        pkg_source_resolve $src $dest >/dev/null (p)
+
+        if (_res !== '') {
+            mkcd "${mak_dir}/$[p.name]/${dest}"
+        }
+
+        case (_res) {
+            git+*                                        { cp -LRf "${_des}/." . }
+            *.tar | *.tar.?? | *.tar.??? | *.tar.???? | *.t?z { pkg_source_tar $_res (p) }
+            ?*                                           { cp -LRf $_res . }
+        }
+    }
+}
+
+proc pkg_depends (pkg, mode='', filter='', chain='', dep_type='') {
+    ### Resolve all dependencies, adding to global deps/deps_seen.
+    if (pkg in deps_seen) { return }
+
+    # Skip build-only deps when installing (not building).
+    if (order_mode === 'install' and dep_type === 'make') { return }
+
+    # Filter out non-explicit, already installed packages.
+    if (filter !== '' and mode === '' and not (pkg in explicit_seen)) {
+        if test -d "${sys_db}/${pkg}" { return }
+    }
+
+    # Circular dependency detection (5 repeats max).
+    if (chain !== '') {
+        var chain_words = chain => split(" ")
+        if (len(chain_words) > 0) {
+            var last = chain_words[-1]
+            var count = 0
+            var i = 0
+            while (i < len(chain_words) - 1) {
+                if (chain_words[i] === last and chain_words[i + 1] === pkg) {
+                    setvar count += 1
+                }
+                setvar i += 1
+            }
+            if (count >= 5) {
+                die "Circular dependency detected $pkg <> $last"
+            }
+        }
+    }
+
+    # Recurse through child dependencies.
+    try { _pkg_find $pkg }
+    if (_status === 0) {
+        var p = null
+        pkg_load $repo_dir (&p)
+        for dep in (p.deps) {
+            if test -d "${sys_db}/${dep}" { continue }
+            pkg_depends $dep '' $filter "$chain $pkg" ''
+        }
+        for dep in (p.mkdeps) {
+            if test -d "${sys_db}/${dep}" { continue }
+            pkg_depends $dep '' $filter "$chain $pkg" 'make'
+        }
+    }
+
+    # Add to deps list unless it's a cached make-dep of an explicit package.
+    if (mode === 'expl' and dep_type === 'make') {
+        try { pkg_cache $pkg }
+        if ! failed { return }
+    }
+
+    call deps->append(pkg)
+    setglobal deps_seen[pkg] = true
+}
+
+var order_mode = 'raw'
+
+proc pkg_order (...pkgs) {
+    ### Order a list of packages based on dependence.
+    setglobal order = []
+    setglobal redro = []
+    setglobal deps = []
+    setglobal deps_seen = {}
+
+    for pkg in (pkgs) {
+        case (pkg) {
+            *@*.tar.* {
+                case (pkg) {
+                    [/]* { call deps->append(pkg); setglobal deps_seen[pkg] = true }
+                    *    { call deps->append("${ppwd}/${pkg}"); setglobal deps_seen["${ppwd}/${pkg}"] = true }
+                }
+            }
+            *[/]* { die "Not a package ($pkg)" }
+            *     { pkg_depends $pkg $order_mode }
+        }
+    }
+
+    # Include deps that aren't installed yet, plus all explicit packages.
+    for pkg in (deps) {
+        var base = ${pkg##$ppwd/}
+        if (contains(pkgs, pkg) or contains(pkgs, base)) {
+            call order->append(pkg)
+            call redro->insert(0, pkg)
+        } elif ! test -d "${sys_db}/${base}" {
+            call order->append(pkg)
+            call redro->insert(0, pkg)
+        }
+    }
+
+    setglobal deps = []
+    setglobal deps_seen = {}
+}
+
+proc pkg_clean_dev (pkg) {
+    ### Remove dev/doc artifacts from the built package tree.
+    var pd = "${pkg_dir}/${pkg}"
+
+    # Static archives — remove only when a shared library exists.
+    # Keeps .a files for packages that can't build shared libs (e.g. zlib
+    # with zig's ld.lld where shared library detection fails).
+    for f in @[glob("${pd}/usr/lib/*.a")] {
+        var base = ${f%.a}
+        var has_so = false
+        for so in @[glob("${base}.so*")] {
+            setvar has_so = true
+            break
+        }
+        if (has_so) { rm -f $f }
+    }
+    # Libtool files — never needed.
+    for f in @[glob("${pd}/usr/lib/*.la")] { rm -f $f }
+
+    # pkgconfig and headers are kept — needed by packages that build
+    # against this library.  Will move to -dev splits later.
+
+    # Info pages, man pages, doc — not useful in a minimal system.
+    rm -rf "${pd}/usr/share/info" "${pd}/usr/share/man" "${pd}/usr/share/doc"
+
+    # Locale data (i18n definitions) — large, not needed at runtime.
+    rm -rf "${pd}/usr/share/i18n"
+
+    # gconv charset modules — keep only UTF-8 and UNICODE.
+    if test -d "${pd}/usr/lib/gconv" {
+        for f in @[glob("${pd}/usr/lib/gconv/*.so")] {
+            case (f) {
+                *UTF* | *UNICODE* { true }
+                * { rm -f $f }
+            }
+        }
+    }
+}
+
+proc pkg_strip (; p Dict) {
+    ### Strip package binaries and libraries.
+    if (p.nostrip === true) { return }
+    if test -f "${mak_dir}/$[p.name]/nostrip" { return }
+    if (KOMINKA_STRIP === '0') {
+        return
+    }
+
+    log $[p.name] "Stripping binaries and libraries"
+
+    while read -r file {
+        if test -h "${pkg_dir}/$[p.name]${file}" { continue }
+
+        case (file) {
+            */sbin/?*[!/] | */bin/?*[!/] | */lib/?*[!/] | \
+            */lib??/?*[!/] | */lib???/?*[!/] | */lib????/?*[!/] {
+                var od_out = $(od -A o -t c -N 18 "${pkg_dir}/$[p.name]${file}")
+
+                # REL (object files (.o), static libraries (.a)).
+                if (od_out ~ / '177' dot* 'E' dot* 'L' dot* 'F' dot* '0000020 001' / or
+                    od_out ~ / '!' dot* '<' dot* 'a' dot* 'r' dot* 'c' dot* 'h' dot* '>' /) {
+                    run strip -g -R .comment -R .note "${pkg_dir}/$[p.name]${file}"
+
+                # EXEC (binaries), DYN (shared libraries).
+                } elif (od_out ~ / '177' dot* 'E' dot* 'L' dot* 'F' dot* '0000020 00' [2 3] /) {
+                    run strip -s -R .comment -R .note "${pkg_dir}/$[p.name]${file}"
+                }
+            }
+        }
+    } < "${pkg_dir}/$[p.name]/${pkg_db}/$[p.name]/manifest"
+}
+
+proc pkg_fix_deps (...manifests; p Dict) {
+    ### Dynamically find missing runtime dependencies using ldd/readelf.
+    log $[p.name] "looking for dependencies (using ${cmd_elf##*/})"
+
+    tmp_file_copy $[p.name] depends depends
+    tmp_file $[p.name] depends-fixed
+
+    if (len(manifests) === 0) {
+        setvar manifests = @[glob("${sys_db}/*/manifest")]
+    }
+
+    var fdep_seen = {}
+
+    while read -r _file {
+        if test -h $_file { continue }
+
+        case (_file) {
+            */sbin/?*[!/] | */bin/?*[!/] | */lib/?*[!/] | \
+            */lib??/?*[!/] | */lib???/?*[!/] | */lib????/?*[!/] {
+
+                var ldd_out = ''
+                try { setvar ldd_out = $(ldd -- "${pkg_dir}/$[p.name]${_file}" 2>/dev/null) }
+                if failed { continue }
+
+                var elf_out = ''
+                try { setvar elf_out = $($cmd_elf -d "${pkg_dir}/$[p.name]${_file}" 2>/dev/null) }
+                if failed { setvar elf_out = ldd_out }
+
+                for lib_line in @(echo $elf_out) {
+                    case (lib_line) {
+                        *NEEDED*[*]* | *=\>* {
+                            var lib = ${lib_line##*\[}
+                            setvar lib = ${lib%%\]*}
+
+                            case (cmd_elf) {
+                                *readelf {
+                                    var tab_pattern = "	$lib => "
+                                    setvar lib = ${ldd_out#*$tab_pattern}
+                                }
+                                * {
+                                    setvar lib = ${lib_line##*=>\ }
+                                }
+                            }
+                            setvar lib = ${lib%% *}
+
+                            # Skip libc, libc++, and POSIX libraries.
+                            var lib_base = ${lib##*/}
+                            case (lib_base) {
+                                ld-* | lib[cm].so* | libc++.so* | libc++abi.so* | \
+                                libcrypt.so* | libdl.so* | libgcc_s.so* | \
+                                libmvec.so* | libpthread.so* | libresolv.so* | \
+                                librt.so* | libstdc++.so* | libtrace.so* | \
+                                libunwind.so* | libutil.so* | libxnet.so* | ldd {
+                                    continue
+                                }
+                            }
+
+                            if (lib in fdep_seen) { continue }
+                            setvar fdep_seen[lib] = true
+
+                            resolve_path $lib
+
+                            try { pkg_owner -e $_rpath manifest }
+                            if ! failed { continue }
+
+                            try { pkg_owner -e $_rpath @manifests }
+                            if ! failed {
+                                write -- $_owns
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } < manifest |
+
+    # Sort and deduplicate.
+    sort -uk1,1 $[tf[-2]] - > $[tf[-1]]
+
+    if test -s $[tf[-1]] {
+        diff -U 3 $[tf[-2]] $[tf[-1]] 2>/dev/null || true
+        mv -f $[tf[-1]] depends
+        pkg_manifest "${PWD##*/}" $pkg_dir
+    }
+}
+
+proc pkg_manifest (pkg, base_dir) {
+    ### Generate the package's manifest (list of all files and directories).
+    log $pkg "Generating manifest"
+
+    tmp_file $pkg manifest
+
+    {
+        write -- "${base_dir}/${pkg}/${pkg_db}/${pkg}/manifest"
+
+        if test -d "${base_dir}/${pkg}/etc" {
+            write -- "${base_dir}/${pkg}/${pkg_db}/${pkg}/etcsums"
+        }
+
+        find "${base_dir}/${pkg}" ! -path "${base_dir}/${pkg}" \
+            -type d -exec printf '%s/\n' {} + \
+            -o \( ! -type d -a ! -name '*.la' -a ! -name charset.alias \) -print
+
+    } | sort -ur > $[tf[-1]]
+
+    # Remove the prefix from each line.
+    while read -r file {
+        write -- "${file#"${base_dir}/${pkg}"}"
+    } < $[tf[-1]] > "${base_dir}/${pkg}/${pkg_db}/${pkg}/manifest"
+}
+
+proc pkg_manifest_validate (pkg) {
+    log $pkg "Checking if manifest valid"
+
+    var missing = 0
+    while read -r line {
+        if ! test -e "${tar_dir}/${pkg}${line}" && ! test -h "${tar_dir}/${pkg}${line}" {
+            write -- $line
+            setvar missing += 1
+        }
+    } < "${pkg_db}/${pkg}/manifest"
+
+    if (missing > 0) {
+        die $pkg "manifest contains $missing non-existent files"
+    }
+}
+
+proc pkg_manifest_replace (pkg, old_entry, new_entry) {
+    ### Replace a line in a package's manifest.
+    tmp_file $pkg "manifest-replace-${old_entry##*/}"
+
+    while read --raw-line {
+        var out = _reply
+        if (out === old_entry) {
+            setvar out = new_entry
+        }
+        write -- $out
+    } < "${sys_db}/${pkg}/manifest" | sort -r > $[tf[-1]]
+
+    mv -f $[tf[-1]] "${sys_db}/${pkg}/manifest"
+}
+
+proc pkg_etcsums (; p Dict) {
+    ### Generate checksums for /etc/ configuration files.
+    log $[p.name] "Generating etcsums"
+
+    if ! test -d "${pkg_dir}/$[p.name]/etc" {
+        return
+    }
+
+    var etc_files = []
+    while read -r etc {
+        # Match /etc/ files that don't end in /
+        if (etc => startsWith('/etc/') and not etc => endsWith('/')) {
+            call etc_files->insert(0, "${pkg_dir}/$[p.name]/${etc}")
+        }
+    } < manifest
+
+    sh256 @etc_files > etcsums
+}
+
+proc pkg_tar (; p Dict) {
+    ### Create a compressed tarball from the built package.
+    log $[p.name] "Creating tarball"
+
+    var tf_path = "${bin_dir}/$[p.name]@$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+
+    cd "${pkg_dir}/$[p.name]"
+
+    tar cf - . | case (KOMINKA_COMPRESS) {
+        bz2  { bzip2 -z }
+        gz   { gzip -6 }
+        lzma { lzma -z }
+        lz   { lzip -z }
+        xz   { xz -z }
+        zst  { zstd -z }
+    } > $tf_path
+
+    cd $OLDPWD
+
+    log $[p.name] "Successfully created tarball"
+
+    run_hook post-package $[p.name] $tf_path
+}
+
+proc pkg_build_all (...pkgs) {
+    ### Build packages and turn them into tarballs.
+
+    # Mark packages passed on the command-line as explicit.
+    setglobal explicit = []
+    setglobal explicit_seen = {}
+    for pkg in (pkgs) {
+        pkg_depends $pkg expl filter
+        call explicit->append(pkg)
+        setglobal explicit_seen[pkg] = true
+    }
+
+    # If this is an update, use pre-built binaries when available.
+    if (prefer_cache === '') {
+        setglobal explicit_build = {}
+        for pkg in (explicit) {
+            setglobal explicit_build[pkg] = true
+        }
+    }
+
+    # If an explicit package is also a dependency of another explicit,
+    # remove it from the explicit list (it will be built in dep order).
+    # Preserve original_explicit to distinguish "was requested" from "is a dep"
+    # — this prevents auto-installing explicitly-requested packages (like zlib)
+    # that get resolved into the implicit dep list.
+    var original_explicit = {}
+    for pkg in (explicit) {
+        setvar original_explicit[pkg] = true
+    }
+    var explicit_filtered = []
+    for pkg in (explicit) {
+        if (not (pkg in deps_seen)) {
+            call explicit_filtered->append(pkg)
+        }
+    }
+    var explicit_cnt = len(explicit_filtered)
+    setglobal explicit = explicit_filtered
+    setglobal explicit_seen = {}
+    for pkg in (explicit) {
+        setglobal explicit_seen[pkg] = true
+    }
+
+    var msg = "Building: explicit: $[explicit => join(' ')]"
+    if (len(deps) > 0) {
+        setvar msg = "${msg}, implicit: $[deps => join(' ')]"
+    }
+    log $msg
+
+    # Full build list: implicit deps first, then explicit.
+    var build_list = []
+    call build_list->extend(deps)
+    call build_list->extend(explicit)
+
+    if (len(build_list) !== explicit_cnt) {
+        prompt
+    }
+
+    log "Checking for pre-built dependencies"
+
+    # Install any pre-built dependencies that exist and are up to date.
+    var to_build = []
+    for pkg in (build_list) {
+        if (not (pkg in explicit_build)) {
+            try { pkg_cache $pkg }
+            if ! failed {
+                log $pkg "Found pre-built binary"
+                forkwait {
+                    setglobal ENV.KOMINKA_FORCE = '1'
+                    setglobal KOMINKA_FORCE = '1'
+                    args i $tar_file
+                }
+                continue
+            }
+        }
+        call to_build->append(pkg)
+    }
+
+    var p = null
+    for pkg in (to_build) {
+        pkg_find_and_load $pkg (&p)
+        pkg_source (p)
+        if (len(p.sources) > 0) {
+            pkg_verify (p)
+        }
+    }
+
+    # Build and create tarballs.
+    var build_cur = 0
+    for pkg in (to_build) {
+        setvar build_cur += 1
+        log $pkg "Building package ($build_cur/$[len(to_build)])"
+
+        pkg_find_and_load $pkg (&p)
+
+        run_hook queue $pkg $build_cur $[len(to_build)]
+
+        if (len(p.sources) > 0) {
+            pkg_extract (p)
+        }
+
+        pkg_build (p)
+        pkg_clean_dev $pkg
+        pkg_manifest $pkg $pkg_dir
+        pkg_strip (p)
+
+        cd "${pkg_dir}/${pkg}/${pkg_db}/${pkg}"
+
+        pkg_fix_deps (p)
+        pkg_etcsums (p)
+        pkg_tar (p)
+
+        if (prefer_cache === '1' or (not (pkg in explicit_seen) and not (pkg in original_explicit))) {
+            log $pkg "Needed as a dependency or has an update, installing"
+            forkwait {
+                setglobal ENV.KOMINKA_FORCE = '1'
+                setglobal KOMINKA_FORCE = '1'
+                args i $pkg
+            }
+        }
+    }
+
+    if (build_install === '1' and KOMINKA_PROMPT === '1') {
+        try { prompt "Install built packages? [$[explicit => join(' ')]]" }
+        if ! failed {
+            forkwait { args i @explicit }
+        }
+    }
+}
+
+proc pkg_build (; p Dict) {
+    ### Run the package's build script.
+    mkcd "${mak_dir}/$[p.name]" "${pkg_dir}/$[p.name]/${pkg_db}"
+
+    log $[p.name] "Starting build"
+
+    run_hook pre-build $[p.name] "${mak_dir}/$[p.name]"
+
+    # Create log file early to catch permission errors.
+    true > "${log_dir}/$[p.name]-${time_str}-${KOMINKA_PID}"
+
+    # Source PKGBUILD.ysh inside the pipe subshell so its `var` declarations
+    # stay local to the subshell and don't shadow pm globals.
+    {
+        source "$[p.dir]/PKGBUILD.ysh"
+
+        setglobal ENV.AR          = "${AR:-ar}"
+        setglobal ENV.MAKEFLAGS   = "${MAKEFLAGS:--j${_nproc}}"
+        setglobal ENV.CC          = "${CC:-cc}"
+        setglobal ENV.CXX         = "${CXX:-c++}"
+        setglobal ENV.CFLAGS      = "${CFLAGS:--O2 -DNDEBUG}"
+        setglobal ENV.CXXFLAGS    = "${CXXFLAGS:--O2 -DNDEBUG}"
+        setglobal ENV.NM          = "${NM:-nm}"
+        setglobal ENV.RANLIB      = "${RANLIB:-ranlib}"
+        setglobal ENV.DESTDIR     = "${pkg_dir}/$[p.name]"
+        setglobal ENV.RUSTFLAGS   = "--remap-path-prefix=$PWD=. ${RUSTFLAGS:-}"
+        setglobal ENV.GOFLAGS     = "-trimpath -modcacherw ${GOFLAGS:-}"
+        setglobal ENV.GOPATH      = "${PWD}/go"
+        setglobal ENV.KOMINKA_ROOT = KOMINKA_ROOT
+        # When KOMINKA_ROOT is not /, installed mkdeps land in a separate tree.
+        # Append its bin dirs to PATH so the build() proc can find them.
+        # Set PKG_CONFIG_SYSROOT_DIR so pkg-config prepends KOMINKA_ROOT to
+        # absolute paths from .pc files (prefix=/usr → /kominka-root/usr).
+        if (KOMINKA_ROOT !== '' and KOMINKA_ROOT !== '/') {
+            setglobal ENV.PATH = "${PATH}:${KOMINKA_ROOT}/usr/bin:${KOMINKA_ROOT}/usr/sbin"
+            setglobal ENV.PKG_CONFIG_SYSROOT_DIR = KOMINKA_ROOT
+        }
+
+        build "${pkg_dir}/$[p.name]" 2>&1
+        write -- $? > "${log_dir}/$[p.name]-${time_str}-${KOMINKA_PID}.exit"
+    } | tee "${log_dir}/$[p.name]-${time_str}-${KOMINKA_PID}"
+
+    var _build_exit = $(cat "${log_dir}/$[p.name]-${time_str}-${KOMINKA_PID}.exit" 2>/dev/null || echo 1)
+    rm -f "${log_dir}/$[p.name]-${time_str}-${KOMINKA_PID}.exit"
+
+    if (_build_exit !== '0') {
+        log $[p.name] "Build failed"
+        log $[p.name] "Log stored to ${log_dir}/$[p.name]-${time_str}-${KOMINKA_PID}"
+
+        try { forkwait { run_hook build-fail $[p.name] "${mak_dir}/$[p.name]" } }
+
+        pkg_clean
+        kill 0
+    }
+
+    if (KOMINKA_KEEPLOG !== '1') {
+        rm -f "${log_dir}/$[p.name]-${time_str}-${KOMINKA_PID}"
+    }
+
+    cp -LRf $[p.dir] "${pkg_dir}/$[p.name]/${pkg_db}/"
+
+    # Generate a depends file from p.deps/p.mkdeps for pkg_installable.
+    var _deps_path = "${pkg_dir}/$[p.name]/${pkg_db}/$[p.name]/depends"
+    true > $_deps_path
+    for d in (p.deps)   { write -- $d        >> $_deps_path }
+    for d in (p.mkdeps) { write -- "$d make" >> $_deps_path }
+
+    # Write version file.
+    write -- "$[p.ver] $[p.rel]" > "${pkg_dir}/$[p.name]/${pkg_db}/$[p.name]/version"
+
+    log $[p.name] "Successfully built package"
+
+    run_hook post-build $[p.name] "${pkg_dir}/$[p.name]"
+}
+
+proc pkg_checksum (pkg) {
+    ### Download sources and print checksums for pasting into PKGBUILD.ysh.
+    var p = null
+    pkg_find_and_load $pkg (&p)
+
+    pkg_source 'c' (p)
+
+    if (len(p.sources) === 0) { return }
+
+    pkg_checksum_gen (p)
+
+    if (hash !== '') {
+        log $pkg "Generated checksums"
+    } else {
+        log $pkg "No sources needing checksums"
+    }
+}
+
+proc pkg_checksum_gen (; p Dict) {
+    ### Generate checksums for a package's sources.
+    var files = []
+
+    for src_line in (p.sources) {
+        var src  = ${src_line%% *}
+        var dest = ''
+        if (src_line !== src) { setvar dest = ${src_line#* } }
+
+        pkg_source_resolve $src $dest >/dev/null (p)
+
+        var _res_stripped = ${_res##git+*}
+        case (_res_stripped) {
+            */*[!.] { call files->append(_res) }
+        }
+    }
+
+    _sh256 @files
+}
+
+proc pkg_verify (; p Dict) {
+    ### Verify package checksums against the stored checksums in PKGBUILD.ysh.
+    # Prefer arch-specific: checksums_aarch64 / checksums_x86_64.
+    var _arch = ${sys_arch%%-*}
+    var _stored = []
+    case (_arch) {
+        aarch64 { if (len(p.checksums_aarch64) > 0) { setvar _stored = p.checksums_aarch64 } }
+        x86_64  { if (len(p.checksums_x86_64)  > 0) { setvar _stored = p.checksums_x86_64  } }
+    }
+    if (len(_stored) === 0) { setvar _stored = p.checksums }
+
+    log $[p.name] "Verifying sources"
+
+    pkg_checksum_gen >/dev/null (p)
+
+    var new_sums = @(echo $hash)
+    var idx = 0
+
+    if (len(new_sums) === 0) { return }
+
+    for stored_sum in (_stored) {
+        var expected = ''
+        if (idx < len(new_sums)) {
+            setvar expected = new_sums[idx]
+        } else {
+            setvar expected = 'no source'
+        }
+
+        write -- "- $stored_sum"
+        write -- "+ $expected"
+
+        if (expected !== stored_sum and stored_sum !== 'SKIP') {
+            die $[p.name] "Checksum mismatch"
+        }
+        setvar idx += 1
+    }
+}
+
+proc pkg_conflicts (pkg) {
+    ### Check for and handle package conflicts via the alternatives system.
+    log $pkg "Checking for package conflicts"
+
+    tmp_file $pkg manifest-files
+    tmp_file $pkg found-conflicts
+
+    # Collect resolved file paths from the tarball manifest.
+    while read -r file {
+        case (file) {
+            *[!/] {
+                resolve_path $file
+                write -- $_rpath
+            }
+        }
+    } < "${PWD}/${pkg_db}/${pkg}/manifest" > $[tf[-2]]
+
+    cd "${tar_dir}/${pkg}"
+
+    var manifests = @[glob("${sys_db}/*/manifest")]
+
+    var other_manifests = []
+    for m in (manifests) {
+        if (m !== "${sys_db}/${pkg}/manifest") {
+            call other_manifests->append(m)
+        }
+    }
+
+    if (len(other_manifests) === 0) { return }
+
+    grep -Fxf $[tf[-2]] -- @other_manifests 2>/dev/null > $[tf[-1]] || true
+
+    # Check if it's safe to auto-enable alternatives.
+    var safe = ''
+    if ! grep -q ":/var/db/kominka/installed/" $[tf[-1]] 2>/dev/null {
+        setvar safe = '1'
+    }
+
+    if test -s $[tf[-1]] {
+        if (KOMINKA_CHOICE !== '1' and safe === '1') {
+            while IFS=: read -r _ con {
+                write -- "Found conflict $con"
+
+                mkdir -p "${PWD}/${cho_db}"
+
+                fnr $con '/' '>'
+
+                try {
+                    mv -f "${PWD}${con}" "${PWD}/${cho_db}/${pkg}${_fnr_val}" 2>/dev/null
+                }
+                if failed {
+                    log "File must be in ${con%/*} and not a symlink to it"
+                    log "This usually occurs when a binary is installed to"
+                    die "/sbin instead of /usr/bin (example)"
+                }
+            } < $[tf[-1]]
+
+            log $pkg "Converted all conflicts to choices (pm a)"
+
+            pkg_manifest $pkg $tar_dir
+        } else {
+            log "Package '$pkg' conflicts with another package" '' '!>'
+            log "Run 'KOMINKA_CHOICE=1 pm i $pkg' to add conflicts" '' '!>'
+            die "as alternatives." '' '!>'
+        }
+    }
+}
+
+proc pkg_alternatives (...args) {
+    if (len(args) > 0 and args[0] === '-') {
+        while read -r pkg path {
+            pkg_swap $pkg $path
+        }
+
+    } elif (len(args) > 0) {
+        pkg_swap @args
+
+    } else {
+        for pkg_file in @[glob("${sys_ch}/*")] {
+            fnr "${pkg_file##*/}" '>' '/'
+            write -- "${_fnr_val%%/*} /${_fnr_val#*/}"
+        }
+    }
+}
+
+proc pkg_swap (pkg, path='') {
+    ### Swap between package alternatives.
+    if ! test -d "${sys_db}/${pkg}" {
+        die "'$pkg' not found"
+    }
+
+    fnr "${pkg}${path}" '/' '>'
+
+    if ! test -f "${sys_ch}/${_fnr_val}" && ! test -h "${sys_ch}/${_fnr_val}" {
+        die "Alternative '$pkg ${path:-null}' doesn't exist"
+    }
+
+    if test -f "${KOMINKA_ROOT}${path}" {
+        try { pkg_owner "/${path#/}" }
+        if failed { die "File '$path' exists on filesystem but isn't owned" }
+
+        log "Swapping '$path' from '$_owns' to '$pkg'"
+
+        cp -Pf "${KOMINKA_ROOT}${path}" "${sys_ch}/${_owns}>${_fnr_val#*>}"
+        pkg_manifest_replace $_owns $path "/${cho_db}/${_owns}>${_fnr_val#*>}"
+    }
+
+    mv -f "${sys_ch}/${_fnr_val}" "${KOMINKA_ROOT}/${path}"
+    pkg_manifest_replace $pkg "/${cho_db}/${_fnr_val}" $path
+}
+
+proc file_rwx (path) {
+    ### Convert ls permissions (rwxrwx---) to octal.
+    setglobal oct = ''
+    var o = 0
+
+    var rwx = $(ls -ld $path)
+
+    for c in 14 22 31 44 52 61 74 82 91 {
+        setvar rwx = ${rwx#?}
+
+        case (rwx) {
+            [rwx]* { setvar o = o + ${c#?} }
+            [st]*  { setvar o = o + 1 }
+        }
+
+        if (${c%?} % 3 === 0) {
+            setglobal oct = "${oct}${o}"
+            setvar o = 0
+        }
+    }
+}
+
+proc pkg_install_files (test_flag, src_dir) {
+    ### Copy files and create directories, preserving permissions.
+    while read -r file {
+        setglobal _file = "${KOMINKA_ROOT}${file}"
+
+        case (file) {
+            */ {
+                if ! test -d $_file {
+                    file_rwx "${src_dir}/${file#/}"
+                    mkdir -m $oct $_file
+                }
+            }
+
+            * {
+                if test -d $_file { continue }
+                if test $test_flag $_file { continue }
+
+                if (file => startsWith('/etc/') and not file => endsWith('/')) {
+                    try { pkg_etc $file }
+                    if failed { continue }
+                }
+
+                if test -h $_file {
+                    cp -fP "${src_dir}${file}" "${_file%/*}/."
+                } else {
+                    var __tmp = "${_file%/*}/__kominka-tmp-${_install_pkg_name}-${file##*/}-${KOMINKA_PID}"
+                    cp -fP "${src_dir}${file}" $__tmp \
+                        && mv -f $__tmp $_file
+                }
+            }
+        }
+    }
+}
+
+proc pkg_remove_files () {
+    ### Remove a file list from the system.
+    var dir_symlinks = []
+
+    while read -r file {
+        if (file => startsWith('/etc/') and len(file) > 5 and not file => endsWith('/')) {
+            sh256 "${KOMINKA_ROOT}/${file}" >/dev/null
+
+            read -r sum_pkg <&3 || true
+
+            if (hash !== sum_pkg) {
+                write -- "Skipping $file (modified)"
+                continue
+            }
+        }
+
+        var _file = "${KOMINKA_ROOT:+"${KOMINKA_ROOT}/"}${file%%/}"
+
+        if test -h $_file {
+            if test -d $_file {
+                var parts = file => split('/')
+                if (len(parts) >= 3 and file => endsWith('/')) {
+                    call dir_symlinks->append(_file)
+                }
+            }
+        } elif test -d $_file {
+            try { rmdir $_file 2>/dev/null }
+        } else {
+            rm -f $_file
+        }
+    }
+
+    for sym in (dir_symlinks) {
+        if ! test -e $sym {
+            rm -f $sym
+        }
+    }
+}
+
+proc pkg_etc (file) {
+    ### Handle /etc/ file installation with 3-way checksum merge.
+    sh256 "${tar_dir}/${_install_pkg_name}${file}" "${KOMINKA_ROOT}${file}" >/dev/null
+
+    var hash_parts = hash => split(\n)
+    var sum_new = hash_parts[0]
+    var sum_sys = ''
+    if (len(hash_parts) > 1) { setvar sum_sys = hash_parts[1] }
+
+    var sum_old = ''
+    read -r sum_old <&3 2>/dev/null || true
+
+    var sum_old_d = 'null'
+    if (sum_old !== '') { setvar sum_old_d = sum_old }
+    var sum_sys_d = 'null'
+    if (sum_sys !== '') { setvar sum_sys_d = sum_sys }
+    # 3-way merge logic for /etc/ files.
+    # old = Y, sys = X, new = Y → skip (unchanged from package perspective)
+    if (sum_new === sum_old and sum_new !== sum_sys) {
+        return 1
+    }
+
+    # old=sys=new (all same), or old=X sys=Y new=Y (user didn't change, pkg updated),
+    # or old=sys and new differs (normal update) → overwrite
+    if (sum_old_d === sum_old and sum_sys_d === sum_old and sum_new === sum_old) {
+        true  # all same, overwrite is fine
+    } elif (sum_sys_d === sum_new) {
+        true  # sys matches new, overwrite is fine
+    } elif (sum_old_d === sum_sys_d) {
+        true  # user didn't modify, overwrite
+    } else {
+        # All other cases — save as .new to not clobber user changes
+        war $_install_pkg_name "saving $file as ${file}.new"
+        setglobal _file = "${_file}.new"
+    }
+}
+
+proc pkg_removable (pkg) {
+    ### Check if a package can be removed (has no dependents).
+    log $pkg "Checking if package removable"
+
+    cd $sys_db
+    var dependents = ''
+    try { setvar dependents = $(grep -lFx -- $pkg */depends) }
+    cd $OLDPWD
+
+    if (dependents !== '') {
+        die $pkg "Not removable, has dependents"
+    }
+}
+
+proc pkg_remove (pkg) {
+    ### Remove a package and all of its files.
+    if ! test -d "${sys_db}/${pkg}" {
+        die "'$pkg' not installed"
+    }
+
+    trap_off
+
+    if (KOMINKA_FORCE !== '1') {
+        pkg_removable $pkg
+    }
+
+    run_hook_pkg pre-remove $pkg
+    run_hook pre-remove $pkg "${sys_db}/${pkg}"
+
+    tmp_file_copy $pkg etcsums-copy "${sys_db}/${pkg}/etcsums"
+
+    log $pkg "Removing package"
+    pkg_remove_files < "${sys_db}/${pkg}/manifest" 3< $[tf[-1]]
+
+    trap_on
+    log $pkg "Removed successfully"
+}
+
+proc pkg_installable (pkg, depends_file) {
+    ### Check if all dependencies are satisfied for installation.
+    log $pkg "Checking if package installable"
+
+    if ! test -f $depends_file { return }
+
+    var missing = 0
+    while true {
+        try { read -r dep dep_type }
+        if (dep === '' and _status !== 0) { break }
+        if (dep === '' or dep => startsWith('#')) { continue }
+        if (dep_type === 'make') { continue }
+
+        if ! test -d "${sys_db}/${dep}" {
+            write -- "$dep $dep_type"
+            setvar missing += 1
+        }
+    } < $depends_file
+
+    if (missing > 0) {
+        die $pkg "Package not installable, missing $missing package(s)"
+    }
+}
+
+proc _fmt_bytes (n) {
+    ### Format byte count to human-readable. Sets _res.
+    if (n >= 1048576) {
+        setglobal _res = "$[n / 1048576]MB"
+    } elif (n >= 1024) {
+        setglobal _res = "$[n / 1024]KB"
+    } else {
+        setglobal _res = "${n}B"
+    }
+}
+
+proc pkg_install_all (...pkgs) {
+    ### Download all packages in parallel, then install sequentially.
+    if (len(pkgs) <= 1) {
+        for pkg in (pkgs) { pkg_install $pkg }
+        return
+    }
+
+    # Resolve which packages need downloading.
+    var urls = {}
+    var dests = {}
+    var dl_names = []
+    var p = null
+    for pkg in (pkgs) {
+        case (pkg) { *.tar.* { continue } }
+        pkg_find_and_load $pkg (&p)
+
+        # Metapackages have no tarball to download.
+        if (len(p.sources) === 0 and ('sha256' not in p or p.sha256 === '')) { continue }
+
+        var _name = "${pkg}@$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+        var _dest = "${bin_dir}/${_name}"
+
+        # Already cached locally — skip.
+        if test -f $_dest { continue }
+        var _found = false
+        for f in @[glob("${bin_dir}/${pkg}@$[p.ver]-$[p.rel].tar.*")] {
+            setvar _found = true
+        }
+        if (_found) { continue }
+
+        var _url = ''
+        if (KOMINKA_REPO !== '') {
+            setvar _url = "${KOMINKA_REPO}/${sys_arch}/${pkg}/$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+            setvar urls[pkg] = _url
+            setvar dests[pkg] = _dest
+            call dl_names->append(pkg)
+        } elif (KOMINKA_BIN_MIRROR !== '') {
+            setvar _url = "${KOMINKA_BIN_MIRROR}/${sys_arch}/${pkg}/$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+            setvar urls[pkg] = _url
+            setvar dests[pkg] = _dest
+            call dl_names->append(pkg)
+        }
+    }
+
+    if (len(urls) > 0) {
+        # Start all downloads silently in background.
+        var pids = {}
+        for pkg in (dl_names) {
+            case (cmd_get) {
+                */curl {
+                    if (KOMINKA_INSECURE === '1') {
+                        fork { $cmd_get -ksfLo $[dests[pkg]] $[urls[pkg]] }
+                    } else {
+                        fork { $cmd_get -sfLo $[dests[pkg]] $[urls[pkg]] }
+                    }
+                }
+                */wget { fork { $cmd_get --no-check-certificate -qO $[dests[pkg]] $[urls[pkg]] } }
+            }
+            setvar pids[pkg] = $!
+        }
+
+        # Poll file sizes and display progress until all complete.
+        var done = {}
+        var n_done = 0
+        var n_total = len(dl_names)
+        while (n_done < n_total) {
+            var parts = []
+            for pkg in (dl_names) {
+                if (pkg in done) { continue }
+
+                # Check if process finished.
+                var alive = true
+                try { kill -0 $[pids[pkg]] 2>/dev/null }
+                if failed { setvar alive = false }
+
+                var sz = 0
+                if test -f $[dests[pkg]] {
+                    try { setvar sz = $(wc -c < $[dests[pkg]]) }
+                }
+                _fmt_bytes $sz
+
+                if (alive) {
+                    call parts->append("${pkg} ${_res}")
+                } else {
+                    # Reap the process.
+                    try { wait $[pids[pkg]] }
+                    if failed {
+                        printf '\n' >&2
+                        rm -f $[dests[pkg]]
+                        die $pkg "Download failed"
+                    }
+                    call parts->append("${pkg} ${_res} ok")
+                    setvar done[pkg] = true
+                    setvar n_done += 1
+                }
+            }
+
+            var line = ''
+            for p in (parts) {
+                if (line !== '') {
+                    setvar line = "${line} | ${p}"
+                } else {
+                    setvar line = p
+                }
+            }
+            printf '\r\e[K%s' "-> ${line}" >&2
+            if (n_done < n_total) { sleep 0.3 }
+        }
+        printf '\n' >&2
+    }
+
+    # Install sequentially — file installations can race on shared dirs.
+    for pkg in (pkgs) { pkg_install $pkg }
+}
+
+proc pkg_install (pkg) {
+    ### Install a built package tarball.
+    # Uses _ipkg (install-pkg) to avoid clobbering the _pkg record dict.
+
+    var _ipkg = ''
+    case (pkg) {
+        *.tar.* {
+            if ! test -f $pkg { die "File '$pkg' does not exist" }
+            setglobal tar_file = pkg
+            setvar _ipkg = ${pkg##*/}
+            setvar _ipkg = ${_ipkg%@*}
+        }
+        * {
+            try { pkg_cache $pkg }
+            if failed {
+                # Metapackage — no tarball. sha256 is authoritative for remote packages.
+                var p = null
+                pkg_find_and_load $pkg (&p)
+                if (len(p.sources) === 0 and ('sha256' not in p or p.sha256 === '')) {
+                    mkdir -p "${sys_db}/${pkg}"
+                    write -- "$[p.ver] $[p.rel]" > "${sys_db}/${pkg}/version"
+                    true > "${sys_db}/${pkg}/depends"
+                    for d in (p.deps)   { write -- $d        >> "${sys_db}/${pkg}/depends" }
+                    for d in (p.mkdeps) { write -- "$d make"  >> "${sys_db}/${pkg}/depends" }
+                    printf '#!/bin/sh\n:\n' > "${sys_db}/${pkg}/build"
+                    chmod +x "${sys_db}/${pkg}/build"
+                    true > "${sys_db}/${pkg}/manifest"
+                    log $pkg "Registered metapackage"
+                    return
+                }
+                die $pkg "Not yet built"
+            }
+            setvar _ipkg = pkg
+        }
+    }
+    setglobal _install_pkg_name = _ipkg
+
+    trap_off
+    mkcd "${tar_dir}/${_ipkg}"
+
+    decompress $tar_file | tar xf -
+
+    if ! test -f "${PWD}/${pkg_db}/${_ipkg}/manifest" {
+        die "Not a valid package"
+    }
+
+    if (KOMINKA_FORCE !== '1') {
+        pkg_manifest_validate $_ipkg
+        pkg_installable $_ipkg "${PWD}/${pkg_db}/${_ipkg}/depends"
+    }
+
+    run_hook pre-install $_ipkg $PWD
+
+    pkg_conflicts $_ipkg
+
+    log $_ipkg "Installing package (${tar_file##*/})"
+
+    tmp_file_copy $_ipkg manifest-copy "${sys_db}/${_ipkg}/manifest"
+    tmp_file_copy $_ipkg etcsums-copy "${sys_db}/${_ipkg}/etcsums"
+    tmp_file $_ipkg manifest-diff
+
+    var tar_man = "${PWD}/${pkg_db}/${_ipkg}/manifest"
+
+    grep -vFxf $tar_man $[tf[-3]] > $[tf[-1]] 2>/dev/null || true
+
+    # Reverse the manifest for shallow-first installation.
+    tmp_file $_ipkg manifest-reverse
+    sort $tar_man > $[tf[-1]]
+
+    try {
+        pkg_install_files -z $PWD < $[tf[-1]] 3< $[tf[-4]]
+        pkg_remove_files < $[tf[-2]] 3< $[tf[-4]]
+        pkg_install_files -e $PWD < $[tf[-1]] 3< $[tf[-4]]
+    }
+    if failed {
+        pkg_clean
+        log $_ipkg "Failed to install package." ERROR
+        die $_ipkg "Filesystem now dirty, manual repair needed."
+    }
+
+    trap_on
+    run_hook_pkg post-install $_ipkg
+    run_hook post-install $_ipkg "${sys_db}/${_ipkg}"
+    log $_ipkg "Installed successfully"
+}
+
+proc pkg_update () {
+    index_refresh
+    log "Updating repositories"
+
+    var kominka_paths = KOMINKA_PATH => split(':')
+
+    for path in (kominka_paths) {
+        var repo = path
+        var repo_type = ''
+
+        if git -C $repo rev-parse 'HEAD@{upstream}' >/dev/null 2>&1 {
+            setvar repo_type = 'git'
+
+            var subm = ''
+            try { setvar subm = $(git -C $repo rev-parse --show-superproject-working-tree 2>/dev/null) }
+            if (subm !== '') {
+                setvar repo = $(git -C $subm rev-parse --show-toplevel)
+            } else {
+                setvar repo = $(git -C $repo rev-parse --show-toplevel)
+            }
+        } elif ! test -d $repo {
+            continue
+        }
+
+        pkg_update_repo $repo $repo_type
+    }
+
+    pkg_upgrade
+}
+
+proc pkg_update_repo (repo, repo_type) {
+    cd $repo || die "Repository '$repo' inaccessible"
+
+    if (PWD in repos_seen) { return }
+    setglobal repos_seen[PWD] = true
+
+    log $PWD ' '
+
+    var need_su = false
+    try { am_owner $PWD }
+    if failed {
+        setvar need_su = true
+        write -- "Need '$user' to update"
+    }
+
+    var su_flag = '0'
+    if (need_su) { setvar su_flag = '1' }
+    run_hook pre-update $su_flag "${user:-}"
+
+    if (repo_type === 'git') {
+        pkg_update_git $need_su
+    }
+
+    run_hook post-update
+}
+
+proc pkg_update_git (need_su) {
+    var verify_sigs = ''
+    try { setvar verify_sigs = $(git config --get merge.verifySignatures 2>/dev/null) }
+    case (verify_sigs) {
+        true { write -- 'Signature verification enabled.' }
+    }
+
+    if (need_su) {
+        as_user git pull
+        as_user git submodule update --remote --init -f
+    } else {
+        git pull
+        git submodule update --remote --init -f
+    }
+}
+
+proc pkg_outdated (; result Ref = null) {
+    ### List installed packages with newer versions available in the repository.
+    var to_update = []
+    var repo_orphans = []
+
+    var inst = null
+    var repo_p = null
+    for pkg_path in @[glob("${sys_db}/*")] {
+        var pkg = ${pkg_path##*/}
+
+        pkg_find $pkg '' '' $sys_db
+        pkg_load $repo_dir (&inst)
+
+        pkg_find_and_load $pkg (&repo_p)
+
+        # Detect repository orphans.
+        case (repo_p.dir) {
+            */var/db/kominka/installed/* {
+                call repo_orphans->append(pkg)
+            }
+        }
+
+        if ("$[inst.ver]-$[inst.rel]" !== "$[repo_p.ver]-$[repo_p.rel]") {
+            call to_update->append(pkg)
+            write -- "$pkg $[inst.ver]-$[inst.rel] => $[repo_p.ver]-$[repo_p.rel]"
+        }
+    }
+
+    if (len(repo_orphans) > 0) {
+        var orphan_list = repo_orphans => join(\n)
+        war "Packages without repository${newline}${orphan_list}"
+    }
+
+    if (len(to_update) === 0 and len(repo_orphans) === 0) {
+        log "All packages up to date"
+    }
+
+    if (result !== null) { call result->setValue(to_update) }
+}
+
+proc pkg_upgrade () {
+    log "Checking for new package versions"
+
+    var to_update = []
+    pkg_outdated (&to_update)
+
+    setglobal build_install = '0'
+    setglobal prefer_cache = '1'
+
+    if (contains(to_update, 'kominka')) {
+        log "Detected package manager update"
+        log "The package manager will be updated first"
+        prompt
+        pkg_build_all pm
+        log "Updated the package manager"
+        log "Re-run 'pm update' to update your system"
+        return
+    }
+
+    if (len(to_update) > 0) {
+        pkg_order @to_update
+
+        prompt "Packages to update ($[len(order)]): $[order => join(' ')]"
+        pkg_build_all @order
+        log "Updated all packages"
+        return
+    }
+}
+
+proc pkg_clean () {
+    ### Clean up build files. Top-level process removes everything.
+    case ("${KOMINKA_DEBUG:-0}-${_KOMINKA_LVL:-1}") {
+        0-1 { rm -rf $proc_dir }
+        0-* { rm -rf $tar_dir }
+    }
+}
+
+proc pkg_help_ext () {
+    log 'Installed extensions (pm-* in PATH)'
+
+    var exts = []
+    try { setvar exts = @(pkg_find 'pm-*' all -x "$PATH" 2>/dev/null) }
+
+    var seen = {}
+    var max_len = 0
+
+    for path in (exts) {
+        var p = ${path#*/pm-}
+        if (p in seen) { continue }
+        setvar seen[p] = true
+        if (len(p) > max_len) {
+            setvar max_len = len(p)
+        }
+    }
+
+    for path in (exts) {
+        setvar p = ${path#*/pm-}
+        if (not (p in seen)) { continue }
+
+        var cmt = ''
+        {
+            read --raw-line
+            read --raw-line (&cmt)
+        } < $path
+        setvar cmt = ${cmt#*\#}
+
+        printf "%b->%b %-${max_len}s %s\\n" \
+            $c1 $c3 $p "$cmt" >&2
+    }
+}
+
+proc trap_on () {
+    trap --add INT { run_hook SIGINT; exit 1 }
+    trap --add EXIT { pkg_clean; run_hook SIGEXIT }
+}
+
+proc trap_off () {
+    trap --remove INT
+    trap --remove EXIT
+}
+
+proc args (action='', ...pkgs) {
+    ### Parse and dispatch CLI commands.
+
+    # Validate arguments.
+    case (action) {
+        a | alternatives {
+            for arg in (pkgs) {
+                try { echo $arg | grep -q '[][!* /]' }
+                if ! failed {
+                    die "Invalid argument ($arg)"
+                }
+            }
+        }
+
+        b | build | c | checksum | d | download | i | install | l | list | p | upload | r | remove {
+            for arg in (pkgs) {
+                var bad = ''
+                case (action) {
+                    i | install | p | upload {
+                        try { setvar bad = $(echo $arg | grep '[][!* ]') } 2>/dev/null
+                    }
+                    * {
+                        try { setvar bad = $(echo $arg | grep '[][!* /]') } 2>/dev/null
+                    }
+                }
+                if (bad !== '') {
+                    die "Invalid argument ('$arg')"
+                }
+            }
+
+            # When no arguments given, use current directory as the package.
+            case (action) {
+                l | list { true }
+                * {
+                    if (len(pkgs) === 0) {
+                        var _new_path = "${PWD%/*}:${KOMINKA_PATH}"
+                        setglobal ENV.KOMINKA_PATH = _new_path
+                        setglobal KOMINKA_PATH = _new_path
+                        setvar pkgs = ["${PWD##*/}"]
+                    }
+                }
+            }
+
+            # Search installed database first when removing.
+            case (action) {
+                r | remove {
+                    var _rm_path = "${sys_db}:${KOMINKA_PATH}"
+                    setglobal ENV.KOMINKA_PATH = _rm_path
+                    setglobal KOMINKA_PATH = _rm_path
+                }
+            }
+
+            case (action) {
+                i | install { setglobal order_mode = 'install' }
+                *           { setglobal order_mode = 'raw' }
+            }
+            pkg_order @pkgs
+            # build resolves deps internally in pkg_build_all; using the order
+            # list here would mark implicit make-deps as "explicit", bypassing
+            # the pre-built binary cache check.
+            case (action) {
+                b | build { true }
+                *         { setvar pkgs = order }
+            }
+        }
+    }
+
+    setglobal _KOMINKA_LVL = _KOMINKA_LVL + 1
+    setglobal ENV._KOMINKA_LVL = "$[_KOMINKA_LVL]"
+
+    # Rerun as root if needed for install/remove/alternatives.
+    case (action) {
+        a | alternatives | i | install | r | remove {
+            if (len(pkgs) > 0) {
+                try { am_owner "${KOMINKA_ROOT}/" }
+                if failed {
+                    trap_off
+
+                    as_user env \
+                        LOGNAME="$user" \
+                        HOME="$HOME" \
+                        XDG_CACHE_HOME="${XDG_CACHE_HOME:-}" \
+                        KOMINKA_COMPRESS="$KOMINKA_COMPRESS" \
+                        KOMINKA_PATH="$KOMINKA_PATH" \
+                        KOMINKA_FORCE="${KOMINKA_FORCE:-}" \
+                        KOMINKA_ROOT="${KOMINKA_ROOT:-}" \
+                        KOMINKA_CHOICE="${KOMINKA_CHOICE:-}" \
+                        KOMINKA_COLOR="${KOMINKA_COLOR:-}" \
+                        KOMINKA_TMPDIR="${KOMINKA_TMPDIR:-}" \
+                        KOMINKA_REPO="${KOMINKA_REPO:-}" \
+                        KOMINKA_TOKEN="${KOMINKA_TOKEN:-}" \
+                        KOMINKA_ARCH="${KOMINKA_ARCH:-}" \
+                        KOMINKA_PID="$KOMINKA_PID" \
+                        _KOMINKA_LVL="$_KOMINKA_LVL" \
+                        $0 $action @pkgs
+
+                    trap_on
+                    return
+                }
+            }
+        }
+    }
+
+    case (action) {
+        a | alternatives { pkg_alternatives @pkgs }
+        b | build        { pkg_build_all @pkgs }
+        c | checksum     { for pkg in (pkgs) { pkg_checksum $pkg } }
+        d | download     {
+            var p = null
+            for pkg in (pkgs) {
+                pkg_find_and_load $pkg (&p)
+                pkg_source (p)
+            }
+        }
+        H | help-ext     { pkg_help_ext @pkgs }
+        i | install      { pkg_install_all @pkgs }
+        l | list         { pkg_list_version @pkgs }
+        n | info         { for pkg in (pkgs) { pkg_info $pkg } }
+        o | outdated     { pkg_outdated }
+        r | remove       { for pkg in (redro) { pkg_remove $pkg } }
+        s | search       { for pkg in (pkgs) { pkg_find $pkg all } }
+        u | update       { pkg_update }
+        p | upload       { for pkg in (pkgs) { pkg_upload $pkg } }
+        U | upgrade      { pkg_upgrade }
+        auth             { pm_auth }
+        v | version      { write -- '5.5.28' }
+
+        h | help | '' {
+            log 'pm [a|b|c|d|h|i|l|p|r|s|u|U|v] [pkg]...'
+            log 'alternatives List and swap alternatives'
+            log 'auth         Authenticate with repository'
+            log 'build        Build packages'
+            log 'checksum     Generate checksums'
+            log 'download     Download sources'
+            log 'help         Show this message'
+            log 'info         Show package details'
+            log 'install      Install packages'
+            log 'outdated     Show packages with newer versions available'
+            log 'list         List installed packages'
+            log 'remove       Remove packages'
+            log 'upload       Upload packages to repository'
+            log 'search       Search for packages'
+            log 'update       Update the system and repositories'
+            log 'upgrade      Update the system'
+            log 'version      Package manager version'
+            write -- ''
+            write -- 'Run "pm [H|help-ext]" to see all actions'
+        }
+
+        * {
+            # Extension dispatch.
+            pkg_find "pm-${action}*" '' -x "$PATH"
+            _KOMINKA_LVL=0 $repo_dir @pkgs
+        }
+    }
+}
+
+proc create_tmp_dirs () {
+    # Normalize KOMINKA_ROOT — strip trailing slashes.
+    setglobal KOMINKA_ROOT = ${KOMINKA_ROOT%"${KOMINKA_ROOT##*[!/]}"}
+
+    mkdir -p "${KOMINKA_ROOT}/" 2>/dev/null || true
+
+    setglobal pkg_db = 'var/db/kominka/installed'
+    setglobal cho_db = 'var/db/kominka/choices'
+    setglobal sys_db = "${KOMINKA_ROOT}/${pkg_db}"
+    setglobal sys_ch = "${KOMINKA_ROOT}/${cho_db}"
+
+    # Persistent cache directories.
+    setglobal cac_dir = "${XDG_CACHE_HOME:-"${HOME%"${HOME##*[!/]}"}/.cache"}"
+    setglobal cac_dir = "${cac_dir%"${cac_dir##*[!/]}"}/kominka"
+
+    setglobal src_dir = "${cac_dir}/sources"
+    setglobal log_dir = "${cac_dir}/logs/${time_str%-*}"
+    setglobal bin_dir = "${cac_dir}/bin"
+
+    # Temporary cache directories.
+    setglobal proc_dir = "${KOMINKA_TMPDIR:-"${cac_dir}/proc"}"
+    setglobal proc_dir = "${proc_dir%"${proc_dir##*[!/]}"}/${KOMINKA_PID}"
+
+    setglobal mak_dir = "${proc_dir}/build"
+    setglobal pkg_dir = "${proc_dir}/pkg"
+    setglobal tar_dir = "${proc_dir}/extract"
+    setglobal tmp_dir = "${proc_dir}/tmp"
+
+    mkdir -p $src_dir $log_dir $bin_dir \
+             $mak_dir $pkg_dir $tar_dir $tmp_dir
+}
+
+proc _discover_tool (env_override, ...fallbacks) {
+    ### Find the first available command from fallbacks, or use env override.
+    if (env_override !== '') {
+        write -- $env_override
+        return
+    }
+    for cmd in (fallbacks) {
+        try { command -v $cmd 2>/dev/null }
+        if ! failed { return }
+    }
+}
+
+proc main (...argv) {
+    # Import environment variables into YSH globals.
+    setglobal HOME           = ENV => get("HOME", "")
+    setglobal LOGNAME        = ENV => get("LOGNAME", "")
+    setglobal PATH           = ENV => get("PATH", "")
+    setglobal XDG_CACHE_HOME = ENV => get("XDG_CACHE_HOME", "")
+    setglobal KOMINKA_ROOT      = ENV => get("KOMINKA_ROOT", "")
+    setglobal KOMINKA_PATH      = ENV => get("KOMINKA_PATH", "")
+    setglobal KOMINKA_COLOR     = ENV => get("KOMINKA_COLOR", "")
+    setglobal KOMINKA_PROMPT    = ENV => get("KOMINKA_PROMPT", "")
+    setglobal KOMINKA_FORCE     = ENV => get("KOMINKA_FORCE", "")
+    setglobal KOMINKA_CHOICE    = ENV => get("KOMINKA_CHOICE", "")
+    setglobal KOMINKA_DEBUG     = ENV => get("KOMINKA_DEBUG", "")
+    setglobal KOMINKA_STRIP     = ENV => get("KOMINKA_STRIP", "")
+    setglobal KOMINKA_INSECURE  = ENV => get("KOMINKA_INSECURE", "")
+    setglobal KOMINKA_HOOK      = ENV => get("KOMINKA_HOOK", "")
+    setglobal KOMINKA_TMPDIR    = ENV => get("KOMINKA_TMPDIR", "")
+    setglobal KOMINKA_KEEPLOG   = ENV => get("KOMINKA_KEEPLOG", "")
+    setglobal KOMINKA_SU        = ENV => get("KOMINKA_SU", "")
+    setglobal KOMINKA_ELF       = ENV => get("KOMINKA_ELF", "")
+    setglobal KOMINKA_CHK       = ENV => get("KOMINKA_CHK", "")
+    setglobal KOMINKA_GET       = ENV => get("KOMINKA_GET", "")
+    setglobal KOMINKA_MIRROR      = ENV => get("KOMINKA_MIRROR", "")
+    setglobal KOMINKA_BIN_MIRROR  = ENV => get("KOMINKA_BIN_MIRROR", "")
+    setglobal KOMINKA_REPO        = ENV => get("KOMINKA_REPO", "")
+    setglobal KOMINKA_TOKEN       = ENV => get("KOMINKA_TOKEN", "")
+    setglobal KOMINKA_ARCH        = ENV => get("KOMINKA_ARCH", "")
+    var _lvl_str = ENV => get("_KOMINKA_LVL", "0") => trim()
+    if (_lvl_str === '') { setvar _lvl_str = "0" }
+    setglobal _KOMINKA_LVL = int(_lvl_str)
+    setglobal CC             = ENV => get("CC", "")
+    setglobal CXX            = ENV => get("CXX", "")
+    setglobal DESTDIR        = ENV => get("DESTDIR", "")
+    setglobal GOPATH         = ENV => get("GOPATH", "")
+    setglobal GOFLAGS        = ENV => get("GOFLAGS", "")
+    setglobal KOMINKA_COMPRESS  = ENV => get("KOMINKA_COMPRESS", "")
+
+    setglobal PWD = $(pwd)
+    setglobal ppwd = PWD
+
+    # Color setup — disabled via KOMINKA_COLOR=0 or non-tty stderr.
+    if (KOMINKA_COLOR !== '0') {
+      if test -t 2 {
+        setglobal c1 = u'\u{1b}[1;33m'
+        setglobal c2 = u'\u{1b}[1;34m'
+        setglobal c3 = u'\u{1b}[m'
+      }
+    }
+
+    if (KOMINKA_COMPRESS === '') { setglobal KOMINKA_COMPRESS = 'gz' }
+    setglobal KOMINKA_PID = ${KOMINKA_PID:-$$}
+
+    # Architecture detection for binary package mirror.
+    if (KOMINKA_ARCH !== '') {
+        setglobal sys_arch = KOMINKA_ARCH
+    } else {
+        var _uname = $(uname -m)
+        case (_uname) {
+            aarch64 { setglobal sys_arch = 'aarch64-linux-gnu' }
+            x86_64  { setglobal sys_arch = 'x86_64-linux-gnu' }
+            *       { setglobal sys_arch = _uname }
+        }
+    }
+
+    if (LOGNAME === '') {
+        die "POSIX requires LOGNAME be set"
+    }
+
+    # CPU count for parallel make.
+    try { setglobal _nproc = $(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) }
+
+
+    # Discover tools via fallback chains.
+    setglobal cmd_su = $(_discover_tool $KOMINKA_SU sudo su)
+    if (cmd_su === '') { setglobal cmd_su = 'su' }
+
+    setglobal cmd_elf = $(_discover_tool $KOMINKA_ELF readelf eu-readelf llvm-readelf)
+    if (cmd_elf === '') { setglobal cmd_elf = 'ldd' }
+
+    setglobal cmd_sha = $(_discover_tool $KOMINKA_CHK openssl sha256sum sha256 shasum digest)
+    if (cmd_sha === '') { die "No sha256 utility found" }
+
+    setglobal cmd_get = $(_discover_tool $KOMINKA_GET curl wget)
+    if (cmd_get === '') { die "No download tool found (curl, wget)" }
+
+    # Config dict — single source of truth for runtime configuration.
+    setglobal config = {
+        root:       KOMINKA_ROOT,
+        path:       KOMINKA_PATH,
+        mirror:     KOMINKA_MIRROR,
+        repo:       KOMINKA_REPO,
+        compress:   KOMINKA_COMPRESS,
+        arch:       sys_arch,
+        force:      KOMINKA_FORCE,
+        prompt:     KOMINKA_PROMPT,
+        strip:      KOMINKA_STRIP,
+        insecure:   KOMINKA_INSECURE,
+        color:      KOMINKA_COLOR,
+        hook:       KOMINKA_HOOK,
+        get:        cmd_get,
+        sha:        cmd_sha,
+        elf:        cmd_elf,
+    }
+
+    setglobal time_str = $(date +%Y-%m-%d-%H:%M)
+
+    setglobal build_install = '1'
+    setglobal prefer_cache = ''
+
+    create_tmp_dirs
+    trap_on
+
+    args @argv
+}
+
+main @ARGV
