@@ -1012,44 +1012,11 @@ proc pkg_source_git (dest, url; p Dict) {
 }
 
 proc pkg_source_tar (file; p Dict) {
-    ### Portable --strip-components 1 for tar extraction.
-    tmp_file $[p.name] tarball
-    tmp_file $[p.name] tarball-manifest
-
-    try { decompress $file > $[tf[-2]] }
-    if failed { die $[p.name] "Failed to decompress $file" }
-
-    try { tar xf $[tf[-2]] }
+    ### Extract source tarball, stripping the top-level directory.
+    # --strip-components=1 handles the common "tar has one top-level dir"
+    # layout without needing sh or find.
+    try { decompress $file | tar xf - --strip-components=1 }
     if failed { die $[p.name] "Failed to extract $file" }
-
-    # Get unique top-level directories.
-    try { tar tf $[tf[-2]] | sort -ut / -k1,1 > $[tf[-1]] }
-    if failed { die $[p.name] "Failed to extract manifest" }
-
-    # Use sh if available, fall back to osh (always present alongside pm).
-    var _sh = $(command -v sh 2>/dev/null || command -v osh)
-
-    while read --raw-line {
-        var _parts = _reply => split('/')
-        var dir = _parts[0]
-        var dir_stripped = ${dir#.}
-        case (dir_stripped) {
-            ?* {
-                if ! test -d $dir { continue }
-
-                mv -f $dir "${KOMINKA_PID}-${dir}"
-
-                find "${KOMINKA_PID}-${dir}/." ! -name . -prune \
-                    -exec $_sh -c 'mv -f "$0" "$@" .' {} + 2>/dev/null \
-                || find "${KOMINKA_PID}-${dir}/." ! -name . -prune \
-                    -exec $_sh -c 'cp -fRp "$0" "$@" .' {} +
-
-                rm -rf "${KOMINKA_PID}-${dir}"
-            }
-        }
-    } < $[tf[-1]]
-
-    rm -f $[tf[-2]]
 }
 
 proc pkg_extract (; p Dict) {
