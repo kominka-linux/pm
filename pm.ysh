@@ -237,9 +237,12 @@ proc fnr_vars (input; p Dict) {
 
 proc am_owner (path) {
     ### Check if the current user owns a path.
+    # root owns everything — skip the ls check.
+    if (LOGNAME === 'root') { return 0 }
+
     var inf = ''
     try { setvar inf = $(ls -ld $path) }
-    if failed { die "Failed to get file info for '$path'" }
+    if failed { return 1 }  # can't stat path; treat as not-owner
 
     read --raw-line (&line) <<< $inf
     var fields = line => split(/ ' '+ /)
