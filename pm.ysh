@@ -2717,17 +2717,6 @@ proc main (...argv) {
 
     setglobal cmd_get = $(_discover_tool $KOMINKA_GET curl wget)
     if (cmd_get === '') { die "No download tool found (curl, wget)" }
-    # Test that cmd_get executes — it may exist but fail due to missing shared
-    # libraries (e.g. libstdc++ linked curl on a minimal system).  Fall back to
-    # wget if the primary choice is broken.
-    try { $cmd_get --version >/dev/null 2>&1 }
-    if failed {
-        var _wget = $(command -v wget 2>/dev/null || true)
-        if (_wget !== '' and _wget !== cmd_get) {
-            try { $_wget --version >/dev/null 2>&1 }
-            if ! failed { setglobal cmd_get = _wget }
-        }
-    }
 
     # Config dict — single source of truth for runtime configuration.
     setglobal config = {
