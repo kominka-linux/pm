@@ -1012,11 +1012,43 @@ proc pkg_source_git (dest, url; p Dict) {
 }
 
 proc pkg_source_tar (file; p Dict) {
-    ### Extract source tarball, stripping the top-level directory.
-    # --strip-components=1 handles the common "tar has one top-level dir"
-    # layout without needing sh or find.
-    try { decompress $file | tar xf - --strip-components=1 }
+    ### Portable --strip-components 1 for tar extraction.
+    tmp_file $[p.name] tarball
+    tmp_file $[p.name] tarball-manifest
+
+    try { decompress $file > $[tf[-2]] }
+    if failed { die $[p.name] "Failed to decompress $file" }
+
+    try { tar xf $[tf[-2]] }
     if failed { die $[p.name] "Failed to extract $file" }
+
+    # Get unique top-level directories.
+    try { tar tf $[tf[-2]] | sort -ut / -k1,1 > $[tf[-1]] }
+    if failed { die $[p.name] "Failed to extract manifest" }
+
+    while read --raw-line {
+        var _parts = _reply => split('/')
+        var dir = _parts[0]
+        var dir_stripped = ${dir#.}
+        case (dir_stripped) {
+            ?* {
+                if ! test -d $dir { continue }
+
+                mv -f $dir "${KOMINKA_PID}-${dir}"
+
+                # Move each direct child to the current directory.
+                # Using find -exec mv directly avoids any sh/$0/$@ semantics.
+                find "${KOMINKA_PID}-${dir}/." ! -name . -prune \
+                    -exec mv -f {} . \; 2>/dev/null \
+                || find "${KOMINKA_PID}-${dir}/." ! -name . -prune \
+                    -exec cp -fRp {} . \;
+
+                rm -rf "${KOMINKA_PID}-${dir}"
+            }
+        }
+    } < $[tf[-1]]
+
+    rm -f $[tf[-2]]
 }
 
 proc pkg_extract (; p Dict) {
