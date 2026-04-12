@@ -29,6 +29,7 @@ var KOMINKA_MIRROR = ''
 var KOMINKA_BIN_MIRROR = ''
 var KOMINKA_REPO = ''
 var KOMINKA_TOKEN = ''
+var R2_PUBLIC_URL = ''
 var KOMINKA_ARCH = ''
 var _KOMINKA_LVL = 0
 var CC = ''
@@ -395,8 +396,14 @@ proc index_load () {
 
 proc index_refresh () {
     ### Download the remote package index.
-    if (KOMINKA_REPO === '') { return }
-    var idx_url = "${KOMINKA_REPO}/${sys_arch}/packages.json"
+    var idx_url = ''
+    if (R2_PUBLIC_URL !== '') {
+        setvar idx_url = "${R2_PUBLIC_URL}/${sys_arch}/packages.json"
+    } elif (KOMINKA_REPO !== '') {
+        setvar idx_url = "${KOMINKA_REPO}/${sys_arch}/packages.json"
+    } else {
+        return
+    }
     var idx_file = "${cac_dir}/packages.json"
     log "Fetching package index"
     try { _download $idx_file $idx_url }
@@ -783,20 +790,26 @@ proc pkg_cache (pkg) {
     # though sources=[] (remote index never stores sources).
     if (len(p.sources) === 0 and ('sha256' not in p or p.sha256 === '')) { return 1 }
 
-    # Try repo server: {arch}/{pkg}/{ver}-{rel}.tar.gz
-    if (KOMINKA_REPO !== '') {
-        var _remote_name = "$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
-        var _remote_url = "${KOMINKA_REPO}/${sys_arch}/${pkg}/${_remote_name}"
-        setglobal tar_file = "${bin_dir}/${pkg}@$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+    var _remote_name = "$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+    setglobal tar_file = "${bin_dir}/${pkg}@$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+
+    # R2 public URL: direct download, no server needed.
+    if (R2_PUBLIC_URL !== '') {
+        var _remote_url = "${R2_PUBLIC_URL}/${sys_arch}/${pkg}/${_remote_name}"
         try { _download $tar_file $_remote_url }
         if ! failed { return 0 }
     }
 
-    # Fallback: legacy binary mirror.
+    # Repo server (redirects to R2 when R2_PUBLIC_URL is also configured there).
+    if (KOMINKA_REPO !== '') {
+        var _remote_url = "${KOMINKA_REPO}/${sys_arch}/${pkg}/${_remote_name}"
+        try { _download $tar_file $_remote_url }
+        if ! failed { return 0 }
+    }
+
+    # Legacy binary mirror.
     if (KOMINKA_BIN_MIRROR !== '') {
-        setvar _remote_name = "$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
-        setvar _remote_url = "${KOMINKA_BIN_MIRROR}/${sys_arch}/${pkg}/${_remote_name}"
-        setglobal tar_file = "${bin_dir}/${pkg}@$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+        var _remote_url = "${KOMINKA_BIN_MIRROR}/${sys_arch}/${pkg}/${_remote_name}"
         try { _download $tar_file $_remote_url }
         if ! failed { return 0 }
     }
@@ -2609,6 +2622,7 @@ proc main (...argv) {
     setglobal KOMINKA_BIN_MIRROR  = ENV => get("KOMINKA_BIN_MIRROR", "")
     setglobal KOMINKA_REPO        = ENV => get("KOMINKA_REPO", "")
     setglobal KOMINKA_TOKEN       = ENV => get("KOMINKA_TOKEN", "")
+    setglobal R2_PUBLIC_URL       = ENV => get("R2_PUBLIC_URL", "")
     setglobal KOMINKA_ARCH        = ENV => get("KOMINKA_ARCH", "")
     var _lvl_str = ENV => get("_KOMINKA_LVL", "0") => trim()
     if (_lvl_str === '') { setvar _lvl_str = "0" }
