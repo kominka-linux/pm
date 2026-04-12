@@ -409,6 +409,9 @@ proc index_refresh () {
     try { _download $idx_file $idx_url }
     if failed {
         war "index" "Failed to fetch remote index"
+        if (R2_PUBLIC_URL === '') {
+            war "hint" "Set R2_PUBLIC_URL to fetch the index directly from R2 (no server needed)"
+        }
         return
     }
     setglobal _remote_loaded = false
@@ -801,10 +804,12 @@ proc pkg_cache (pkg) {
     }
 
     # Repo server (redirects to R2 when R2_PUBLIC_URL is also configured there).
+    var _server_failed = false
     if (KOMINKA_REPO !== '') {
         var _remote_url = "${KOMINKA_REPO}/${sys_arch}/${pkg}/${_remote_name}"
         try { _download $tar_file $_remote_url }
         if ! failed { return 0 }
+        setvar _server_failed = true
     }
 
     # Legacy binary mirror.
@@ -814,6 +819,9 @@ proc pkg_cache (pkg) {
         if ! failed { return 0 }
     }
 
+    if (_server_failed and R2_PUBLIC_URL === '') {
+        war $pkg "Repo server unreachable — set R2_PUBLIC_URL to download directly from R2"
+    }
     return 1
 }
 
