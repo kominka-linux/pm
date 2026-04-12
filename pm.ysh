@@ -796,17 +796,19 @@ proc pkg_cache (pkg) {
     var _remote_name = "$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
     setglobal tar_file = "${bin_dir}/${pkg}@$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
 
+    var _remote_url = ''
+    var _server_failed = false
+
     # R2 public URL: direct download, no server needed.
     if (R2_PUBLIC_URL !== '') {
-        var _remote_url = "${R2_PUBLIC_URL}/${sys_arch}/${pkg}/${_remote_name}"
+        setvar _remote_url = "${R2_PUBLIC_URL}/${sys_arch}/${pkg}/${_remote_name}"
         try { _download $tar_file $_remote_url }
         if ! failed { return 0 }
     }
 
     # Repo server (redirects to R2 when R2_PUBLIC_URL is also configured there).
-    var _server_failed = false
     if (KOMINKA_REPO !== '') {
-        var _remote_url = "${KOMINKA_REPO}/${sys_arch}/${pkg}/${_remote_name}"
+        setvar _remote_url = "${KOMINKA_REPO}/${sys_arch}/${pkg}/${_remote_name}"
         try { _download $tar_file $_remote_url }
         if ! failed { return 0 }
         setvar _server_failed = true
@@ -814,7 +816,7 @@ proc pkg_cache (pkg) {
 
     # Legacy binary mirror.
     if (KOMINKA_BIN_MIRROR !== '') {
-        var _remote_url = "${KOMINKA_BIN_MIRROR}/${sys_arch}/${pkg}/${_remote_name}"
+        setvar _remote_url = "${KOMINKA_BIN_MIRROR}/${sys_arch}/${pkg}/${_remote_name}"
         try { _download $tar_file $_remote_url }
         if ! failed { return 0 }
     }
