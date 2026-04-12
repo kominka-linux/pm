@@ -779,11 +779,20 @@ proc pkg_cache (pkg) {
     var p = null
     pkg_find_and_load $pkg (&p)
 
-    setglobal tar_file = "${bin_dir}/${pkg}@$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+    # Prefer the published version from the remote index — the local PKGBUILD
+    # may be ahead of what has been built and uploaded.
+    var _cver = p.ver
+    var _crel = p.rel
+    if (_remote_loaded and pkg in _remote_index) {
+        setvar _cver = _remote_index[pkg]['ver']
+        setvar _crel = _remote_index[pkg]['rel']
+    }
+
+    setglobal tar_file = "${bin_dir}/${pkg}@${_cver}-${_crel}.tar.${KOMINKA_COMPRESS}"
 
     if test -f $tar_file { return 0 }
 
-    for f in @[glob("${bin_dir}/${pkg}@$[p.ver]-$[p.rel].tar.*")] {
+    for f in @[glob("${bin_dir}/${pkg}@${_cver}-${_crel}.tar.*")] {
         setglobal tar_file = f
         return 0
     }
@@ -793,8 +802,8 @@ proc pkg_cache (pkg) {
     # though sources=[] (remote index never stores sources).
     if (len(p.sources) === 0 and ('sha256' not in p or p.sha256 === '')) { return 1 }
 
-    var _remote_name = "$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
-    setglobal tar_file = "${bin_dir}/${pkg}@$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+    var _remote_name = "${_cver}-${_crel}.tar.${KOMINKA_COMPRESS}"
+    setglobal tar_file = "${bin_dir}/${pkg}@${_cver}-${_crel}.tar.${KOMINKA_COMPRESS}"
 
     var _remote_url = ''
     var _server_failed = false
@@ -2018,6 +2027,13 @@ proc pkg_install_all (...pkgs) {
         return
     }
 
+    # Fetch the remote index so URL construction uses the published version,
+    # not the local PKGBUILD version (which may be ahead of what's uploaded).
+    if (R2_PUBLIC_URL !== '' or KOMINKA_REPO !== '') {
+        index_refresh
+        index_load
+    }
+
     # Resolve which packages need downloading.
     var urls = {}
     var dests = {}
@@ -2030,25 +2046,35 @@ proc pkg_install_all (...pkgs) {
         # Metapackages have no tarball to download.
         if (len(p.sources) === 0 and ('sha256' not in p or p.sha256 === '')) { continue }
 
-        var _name = "${pkg}@$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+        # Prefer the published version from the remote index — the local
+        # PKGBUILD may have a newer rel not yet built and uploaded.
+        var _dver = p.ver
+        var _drel = p.rel
+        if (_remote_loaded and pkg in _remote_index) {
+            setvar _dver = _remote_index[pkg]['ver']
+            setvar _drel = _remote_index[pkg]['rel']
+        }
+
+        var _name = "${pkg}@${_dver}-${_drel}.tar.${KOMINKA_COMPRESS}"
         var _dest = "${bin_dir}/${_name}"
 
         # Already cached locally — skip.
         if test -f $_dest { continue }
         var _found = false
-        for f in @[glob("${bin_dir}/${pkg}@$[p.ver]-$[p.rel].tar.*")] {
+        for f in @[glob("${bin_dir}/${pkg}@${_dver}-${_drel}.tar.*")] {
             setvar _found = true
         }
         if (_found) { continue }
 
         var _url = ''
-        if (KOMINKA_REPO !== '') {
-            setvar _url = "${KOMINKA_REPO}/${sys_arch}/${pkg}/$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
-            setvar urls[pkg] = _url
-            setvar dests[pkg] = _dest
-            call dl_names->append(pkg)
+        if (R2_PUBLIC_URL !== '') {
+            setvar _url = "${R2_PUBLIC_URL}/${sys_arch}/${pkg}/${_dver}-${_drel}.tar.${KOMINKA_COMPRESS}"
+        } elif (KOMINKA_REPO !== '') {
+            setvar _url = "${KOMINKA_REPO}/${sys_arch}/${pkg}/${_dver}-${_drel}.tar.${KOMINKA_COMPRESS}"
         } elif (KOMINKA_BIN_MIRROR !== '') {
-            setvar _url = "${KOMINKA_BIN_MIRROR}/${sys_arch}/${pkg}/$[p.ver]-$[p.rel].tar.${KOMINKA_COMPRESS}"
+            setvar _url = "${KOMINKA_BIN_MIRROR}/${sys_arch}/${pkg}/${_dver}-${_drel}.tar.${KOMINKA_COMPRESS}"
+        }
+        if (_url !== '') {
             setvar urls[pkg] = _url
             setvar dests[pkg] = _dest
             call dl_names->append(pkg)
