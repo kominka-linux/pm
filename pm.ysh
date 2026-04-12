@@ -1026,6 +1026,9 @@ proc pkg_source_tar (file; p Dict) {
     try { tar tf $[tf[-2]] | sort -ut / -k1,1 > $[tf[-1]] }
     if failed { die $[p.name] "Failed to extract manifest" }
 
+    # Use sh if available, fall back to osh (always present alongside pm).
+    var _sh = $(command -v sh 2>/dev/null || command -v osh)
+
     while read --raw-line {
         var _parts = _reply => split('/')
         var dir = _parts[0]
@@ -1037,9 +1040,9 @@ proc pkg_source_tar (file; p Dict) {
                 mv -f $dir "${KOMINKA_PID}-${dir}"
 
                 find "${KOMINKA_PID}-${dir}/." ! -name . -prune \
-                    -exec sh -c 'mv -f "$0" "$@" .' {} + 2>/dev/null \
+                    -exec $_sh -c 'mv -f "$0" "$@" .' {} + 2>/dev/null \
                 || find "${KOMINKA_PID}-${dir}/." ! -name . -prune \
-                    -exec sh -c 'cp -fRp "$0" "$@" .' {} +
+                    -exec $_sh -c 'cp -fRp "$0" "$@" .' {} +
 
                 rm -rf "${KOMINKA_PID}-${dir}"
             }
