@@ -965,25 +965,35 @@ proc pkg_source (checksum_mode=''; p Dict) {
 proc pkg_source_url (dest, url, fatal='y'; p Dict) {
     log $[p.name] "Downloading $url"
 
-    case (cmd_get) {
-        */curl {
-            var curl_args = ['-fLo', dest, url]
-            if (KOMINKA_INSECURE === '1') { setvar curl_args = ['-kfLo', dest, url] }
-            try { $cmd_get @curl_args }
+    var delay = 2
+    var attempt = 0
+    var max_attempts = 5
+    while (attempt < max_attempts) {
+        setvar attempt += 1
+        case (cmd_get) {
+            */curl {
+                var curl_args = ['-fLo', dest, url]
+                if (KOMINKA_INSECURE === '1') { setvar curl_args = ['-kfLo', dest, url] }
+                try { $cmd_get @curl_args }
+            }
+            */wget {
+                # busybox wget does not implement TLS certificate validation;
+                # --no-check-certificate is required for any HTTPS download.
+                try { $cmd_get --no-check-certificate -qO $dest $url }
+            }
         }
-        */wget {
-            # busybox wget does not implement TLS certificate validation;
-            # --no-check-certificate is required for any HTTPS download.
-            try { $cmd_get --no-check-certificate -qO $dest $url }
-        }
-    }
-    if failed {
+        if !failed { return }
         rm -f $dest
-        if (fatal === 'y') {
-            die $[p.name] "Failed to download $url"
+        if (attempt < max_attempts) {
+            war $[p.name] "Download failed (attempt $attempt/$max_attempts), retrying in ${delay}s…"
+            sleep $delay
+            setvar delay = delay * 2
         }
-        return 1
     }
+    if (fatal === 'y') {
+        die $[p.name] "Failed to download $url after $max_attempts attempts"
+    }
+    return 1
 }
 
 proc pkg_source_git (dest, url; p Dict) {
