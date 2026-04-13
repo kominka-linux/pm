@@ -1234,7 +1234,7 @@ proc pkg_depends (pkg, mode='', filter='', chain='', dep_type='') {
             try { pkg_cache $pkg }
             if ! failed { setvar _cached = true }
         }
-        if not _cached {
+        if (not _cached) {
             for dep in (p.mkdeps) {
                 if test -d "${sys_db}/${dep}" { continue }
                 pkg_depends $dep '' $filter "$chain $pkg" 'make'
