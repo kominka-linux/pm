@@ -1079,6 +1079,100 @@ proc pkg_extract (; p Dict) {
     }
 }
 
+var tree_seen = {}
+
+proc _pkg_tree_node (pkg, prefix, is_last) {
+    ### Recursively render one node of a dependency tree.
+    var icon = '├── '
+    var pad  = "${prefix}│   "
+    if (is_last === 'y') {
+        setvar icon = '└── '
+        setvar pad  = "${prefix}    "
+    }
+    if (prefix === '') { setvar icon = '' }
+
+    # Mark installed packages.
+    var tag = ''
+    if test -d "${sys_db}/${pkg}" { setvar tag = " ${c2}✓${c3}" }
+
+    if (pkg in tree_seen) {
+        write -- "${prefix}${icon}${c1}${pkg}${c3}${tag} [...]"
+        return
+    }
+    setglobal tree_seen[pkg] = true
+
+    write -- "${prefix}${icon}${c1}${pkg}${c3}${tag}"
+
+    # Load the package to get its deps; silently skip if not in repo.
+    try { _pkg_find $pkg }
+    if (_status !== 0) { return }
+    var p = null
+    pkg_load $repo_dir (&p)
+
+    # Build combined dep list: runtime deps first, then make-deps (labelled).
+    var all_deps = []
+    for d in (p.deps)   { call all_deps->append(d) }
+    for d in (p.mkdeps) { call all_deps->append("${d}:make") }
+
+    var n = len(all_deps)
+    var i = 0
+    for entry in (all_deps) {
+        setvar i += 1
+        var dep  = ${entry%%:make}
+        var last = 'n'
+        if (i === n) { setvar last = 'y' }
+        _pkg_tree_node $dep $pad $last
+    }
+}
+
+proc pkg_tree (...pkgs) {
+    ### Print dependency tree for one or more packages.
+    ### With no arguments, prints trees for all installed packages.
+    setglobal tree_seen = {}
+
+    if (len(pkgs) === 0) {
+        # Collect all installed packages.
+        var installed = @[glob("${sys_db}/*")]
+        if (len(installed) === 0) {
+            log '' 'no packages installed'
+            return
+        }
+
+        # Find root packages: installed packages not depended on by any other
+        # installed package.  These form the forest tops.
+        var depended_on = {}
+        for d in (installed) {
+            if test -f "${d}/depends" {
+                while read -r _dep _dtype {
+                    if (_dep !== '' and _dtype !== 'make') {
+                        setglobal depended_on[_dep] = true
+                    }
+                } < "${d}/depends"
+            }
+        }
+
+        var roots = []
+        for d in (installed) {
+            var name = ${d##*/}
+            if not (name in depended_on) { call roots->append(name) }
+        }
+        # Fall back to showing everything if no clear roots found.
+        if (len(roots) === 0) {
+            for d in (installed) { call roots->append(${d##*/}) }
+        }
+        setvar pkgs = roots
+    }
+
+    var total = len(pkgs)
+    var idx = 0
+    for pkg in (pkgs) {
+        setvar idx += 1
+        setglobal tree_seen = {}
+        _pkg_tree_node $pkg '' 'y'
+        if (idx < total) { write -- '' }
+    }
+}
+
 proc pkg_depends (pkg, mode='', filter='', chain='', dep_type='') {
     ### Resolve all dependencies, adding to global deps/deps_seen.
     if (pkg in deps_seen) { return }
@@ -2450,7 +2544,7 @@ proc args (action='', ...pkgs) {
             }
         }
 
-        b | build | c | checksum | d | download | i | install | l | list | p | upload | r | remove {
+        b | build | c | checksum | d | download | i | install | l | list | p | upload | r | remove | t | tree {
             for arg in (pkgs) {
                 var bad = ''
                 case (action) {
@@ -2468,7 +2562,7 @@ proc args (action='', ...pkgs) {
 
             # When no arguments given, use current directory as the package.
             case (action) {
-                l | list { true }
+                l | list | t | tree { true }
                 * {
                     if (len(pkgs) === 0) {
                         var _new_path = "${PWD%/*}:${KOMINKA_PATH}"
@@ -2542,6 +2636,7 @@ proc args (action='', ...pkgs) {
     case (action) {
         a | alternatives { pkg_alternatives @pkgs }
         b | build        { pkg_build_all @pkgs }
+        t | tree         { pkg_tree @pkgs }
         c | checksum     { for pkg in (pkgs) { pkg_checksum $pkg } }
         d | download     {
             var p = null
@@ -2578,6 +2673,7 @@ proc args (action='', ...pkgs) {
             log 'remove       Remove packages'
             log 'upload       Upload packages to repository'
             log 'search       Search for packages'
+            log 'tree         Show dependency tree'
             log 'update       Update the system and repositories'
             log 'upgrade      Update the system'
             log 'version      Package manager version'
