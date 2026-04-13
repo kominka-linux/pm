@@ -1230,7 +1230,7 @@ proc pkg_depends (pkg, mode='', filter='', chain='', dep_type='') {
         # Never skip makedeps for the explicit package itself: it's always built,
         # so its makedeps are always needed regardless of what's in the cache.
         var _cached = false
-        if (dep_type !== 'make' and not (pkg in explicit_seen)) {
+        if (dep_type !== 'make' and mode !== 'expl') {
             try { pkg_cache $pkg }
             if ! failed { setvar _cached = true }
         }
