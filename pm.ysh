@@ -1223,9 +1223,20 @@ proc pkg_depends (pkg, mode='', filter='', chain='', dep_type='') {
             if test -d "${sys_db}/${dep}" { continue }
             pkg_depends $dep '' $filter "$chain $pkg" ''
         }
-        for dep in (p.mkdeps) {
-            if test -d "${sys_db}/${dep}" { continue }
-            pkg_depends $dep '' $filter "$chain $pkg" 'make'
+        # Only pull in makedeps if we actually need to build this package.
+        # If a pre-built binary is available in the cache, makedeps are
+        # unnecessary — skipping them avoids installing zig/make/etc. just
+        # because a cached runtime dep happens to need them to build.
+        var _cached = false
+        if (dep_type !== 'make') {
+            try { pkg_cache $pkg }
+            if ! failed { setvar _cached = true }
+        }
+        if not _cached {
+            for dep in (p.mkdeps) {
+                if test -d "${sys_db}/${dep}" { continue }
+                pkg_depends $dep '' $filter "$chain $pkg" 'make'
+            }
         }
     }
 
