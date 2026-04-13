@@ -1227,8 +1227,10 @@ proc pkg_depends (pkg, mode='', filter='', chain='', dep_type='') {
         # If a pre-built binary is available in the cache, makedeps are
         # unnecessary — skipping them avoids installing zig/make/etc. just
         # because a cached runtime dep happens to need them to build.
+        # Never skip makedeps for the explicit package itself: it's always built,
+        # so its makedeps are always needed regardless of what's in the cache.
         var _cached = false
-        if (dep_type !== 'make') {
+        if (dep_type !== 'make' and not (pkg in explicit_seen)) {
             try { pkg_cache $pkg }
             if ! failed { setvar _cached = true }
         }
