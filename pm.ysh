@@ -764,16 +764,76 @@ proc pkg_upload (pkg) {
     var _mkdeps_header = _p.mkdeps => join(',')
 
     log $_pkg "Uploading ${_tarball##*/}"
-    $cmd_get -sf -X POST "${KOMINKA_REPO}/api/upload" \
-        -H "Authorization: Bearer ${_token}" \
-        -H "X-Arch: ${sys_arch}" \
-        -H "X-Pkg: ${_pkg}" \
-        -H "X-Ver: $[_p.ver]" \
-        -H "X-Rel: $[_p.rel]" \
-        -H "X-Deps: ${_deps_header}" \
-        -H "X-Mkdeps: ${_mkdeps_header}" \
-        --data-binary "@${_tarball}" \
-        || die $_pkg "Upload failed"
+
+    # For files > 50 MB use presigned direct-to-R2 upload to bypass the
+    # Cloudflare proxy's 100 MB request body limit.
+    var _size = $(stat -c %s $_tarball 2>/dev/null || wc -c < $_tarball)
+    var _resp_tmp = "/tmp/pm_upload_resp_$$"
+
+    if (_size > 50 * 1024 * 1024) {
+        # Step 1: get a presigned PUT URL from the server.
+        var _presign_code = $($cmd_get -s -w '%{http_code}' -o $_resp_tmp \
+            -X POST "${KOMINKA_REPO}/api/upload-url" \
+            -H "Authorization: Bearer ${_token}" \
+            -H "X-Arch: ${sys_arch}" \
+            -H "X-Pkg: ${_pkg}" \
+            -H "X-Ver: $[_p.ver]" \
+            -H "X-Rel: $[_p.rel]")
+        var _presign_body = $(cat $_resp_tmp)
+        rm -f $_resp_tmp
+        if (_presign_code !== '200') {
+            die $_pkg "Upload URL request failed (HTTP $_presign_code): $_presign_body"
+        }
+        # Extract URL from {"url":"..."}
+        var _put_url = $(echo $_presign_body | grep -o '"url":"[^"]*"' | sed 's/"url":"//;s/"//')
+        if (_put_url === '') { die $_pkg "Could not parse presigned URL from server response" }
+
+        # Step 2: PUT directly to R2 (bypasses Cloudflare proxy).
+        var _put_code = $($cmd_get -s -w '%{http_code}' -o $_resp_tmp \
+            -X PUT "$_put_url" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@${_tarball}")
+        var _put_body = $(cat $_resp_tmp)
+        rm -f $_resp_tmp
+        if (_put_code !== '200') {
+            die $_pkg "Direct R2 upload failed (HTTP $_put_code): $_put_body"
+        }
+
+        # Step 3: register the package in the server index.
+        var _sha256 = $(sha256sum $_tarball | awk '{print $1}')
+        var _idx_code = $($cmd_get -s -w '%{http_code}' -o $_resp_tmp \
+            -X POST "${KOMINKA_REPO}/api/update-index" \
+            -H "Authorization: Bearer ${_token}" \
+            -H "X-Arch: ${sys_arch}" \
+            -H "X-Pkg: ${_pkg}" \
+            -H "X-Ver: $[_p.ver]" \
+            -H "X-Rel: $[_p.rel]" \
+            -H "X-Deps: ${_deps_header}" \
+            -H "X-Mkdeps: ${_mkdeps_header}" \
+            -H "X-Sha256: ${_sha256}")
+        var _idx_body = $(cat $_resp_tmp)
+        rm -f $_resp_tmp
+        if (_idx_code !== '201') {
+            die $_pkg "Index update failed (HTTP $_idx_code): $_idx_body"
+        }
+    } else {
+        var _code = $($cmd_get -s -w '%{http_code}' -o $_resp_tmp \
+            -X POST "${KOMINKA_REPO}/api/upload" \
+            -H "Authorization: Bearer ${_token}" \
+            -H "X-Arch: ${sys_arch}" \
+            -H "X-Pkg: ${_pkg}" \
+            -H "X-Ver: $[_p.ver]" \
+            -H "X-Rel: $[_p.rel]" \
+            -H "X-Deps: ${_deps_header}" \
+            -H "X-Mkdeps: ${_mkdeps_header}" \
+            --data-binary "@${_tarball}")
+        var _body = $(cat $_resp_tmp)
+        rm -f $_resp_tmp
+        if (_code !== '201') {
+            die $_pkg "Upload failed (HTTP $_code): $_body"
+        }
+    }
+
     log $_pkg "Uploaded"
 }
 
