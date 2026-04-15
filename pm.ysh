@@ -25,7 +25,6 @@ var KOMINKA_SU = ''
 var KOMINKA_ELF = ''
 var KOMINKA_CHK = ''
 var KOMINKA_GET = ''
-var KOMINKA_MIRROR = ''
 var KOMINKA_BIN_MIRROR = ''
 var KOMINKA_REPO = ''
 var KOMINKA_TOKEN = ''
@@ -61,6 +60,7 @@ var cac_dir = ''
 var src_dir = ''
 var log_dir = ''
 var bin_dir = ''
+var mir_dir = ''
 
 var proc_dir = ''
 var mak_dir = ''
@@ -113,6 +113,7 @@ var explicit_build = {}
 var order = []
 var redro = []
 var repos_seen = {}
+var mirror_used = {}
 
 # Remote package index (populated by index_load from cached packages.json).
 var _remote_index = {}
@@ -835,6 +836,8 @@ proc pkg_upload (pkg) {
     }
 
     log $_pkg "Uploaded"
+
+    pkg_source_upload $_pkg (_p)
 }
 
 proc pkg_cache (pkg) {
@@ -1006,14 +1009,6 @@ proc pkg_source (checksum_mode=''; p Dict) {
                 var src_prefix = "${src_type}+"
                 var src_url = ${_res##$src_prefix}
 
-                if (src_type === 'url' and KOMINKA_MIRROR !== '') {
-                    var mirror_file = ${src_url##*/}
-                    var mirror_url = "${KOMINKA_MIRROR}/$[p.name]/${mirror_file}"
-                    try { pkg_source_url $_des $mirror_url 'n' (p) }
-                    if ! failed { continue }
-                    war $[p.name] "Mirror unavailable, trying upstream"
-                }
-
                 "pkg_source_${src_type}" $_des $src_url (p)
             }
         }
@@ -1147,6 +1142,68 @@ proc pkg_extract (; p Dict) {
             ?*                                           { cp -LRf $_res . }
         }
     }
+}
+
+proc pkg_mirror_use (; p Dict) {
+    ### Download and extract the mirror source tarball if available.
+    ### Returns non-zero if no mirror exists, version mismatches, or verification fails.
+    if (KOMINKA_REPO === '') { return 1 }
+    index_load
+    if (not (p.name in _remote_index)) { return 1 }
+    var _ri = _remote_index[p.name]
+    var _src_sha = _ri => get('src_sha256', '')
+    if (_src_sha === '') { return 1 }
+    if (_ri['ver'] !== p.ver or _ri['rel'] !== p.rel) { return 1 }
+
+    var _local = "${mir_dir}/$[p.name]@$[p.ver]-$[p.rel].tar.bz2"
+
+    if ! test -f $_local {
+        var _url = "${KOMINKA_REPO}/src/$[p.name]/$[p.ver]-$[p.rel].tar.bz2"
+        log $[p.name] "Downloading mirror source"
+        mkdir -p $mir_dir
+        try { pkg_source_url $_local $_url (p) }
+        if failed { return 1 }
+    }
+
+    # Verify against the checksum recorded in the remote index.
+    _sh256 $_local >/dev/null
+    if (hash !== _src_sha) {
+        war $[p.name] "Mirror source checksum mismatch, falling back to upstream"
+        rm -f $_local
+        return 1
+    }
+
+    log $[p.name] "Extracting mirror source"
+    mkdir -p "${mak_dir}/$[p.name]"
+    tar xjf $_local -C "${mak_dir}/$[p.name]"
+}
+
+proc pkg_git_strip (; p Dict) {
+    ### Remove .git directories from the source tree before processing and packing.
+    find "${mak_dir}/$[p.name]" -name .git -type d -prune -exec rm -rf {} + 2>/dev/null || true
+}
+
+proc pkg_source_process (; p Dict) {
+    ### Call process() from PKGBUILD.ysh if defined, to prune the source tree.
+    if ! grep -q '^proc process[( ]' "$[p.dir]/PKGBUILD.ysh" { return }
+    log $[p.name] "Processing sources"
+    var _src = "${mak_dir}/$[p.name]"
+    try {
+        forkwait {
+            source "$[p.dir]/PKGBUILD.ysh"
+            cd $_src
+            process $_src
+        }
+    }
+    if failed { die $[p.name] "process() failed" }
+}
+
+proc pkg_source_pack (; p Dict) {
+    ### Pack the build directory into a processed source tarball (.tar.bz2).
+    log $[p.name] "Packing source tarball"
+    mkdir -p $mir_dir
+    var _out = "${mir_dir}/$[p.name]@$[p.ver]-$[p.rel].tar.bz2"
+    tar cf - -C "${mak_dir}/$[p.name]" . | bzip2 -z > $_out
 }
 
 var tree_seen = {}
@@ -1606,6 +1663,77 @@ proc pkg_tar (; p Dict) {
     run_hook post-package $[p.name] $tf_path
 }
 
+proc pkg_source_upload (pkg; p Dict) {
+    ### Upload the processed source tarball to the repository server.
+    if (KOMINKA_REPO === '') { die "KOMINKA_REPO not set" }
+    var _tarball = "${mir_dir}/${pkg}@$[p.ver]-$[p.rel].tar.bz2"
+    if ! test -f $_tarball {
+        log $pkg "No source tarball cached — run 'pm b $pkg' first to generate it" WARNING
+        return
+    }
+
+    var _token = ''
+    auth_token_load (&_token)
+    if (_token === '') { die "Not authenticated — set KOMINKA_TOKEN or run 'pm auth'" }
+
+    log $pkg "Uploading source tarball"
+    var _resp_tmp = "/tmp/pm_src_resp_$$"
+    var _code = $($cmd_get -s -w '%{http_code}' -o $_resp_tmp \
+        -X POST "${KOMINKA_REPO}/api/upload-src" \
+        -H "Authorization: Bearer ${_token}" \
+        -H "X-Pkg: ${pkg}" \
+        -H "X-Ver: $[p.ver]" \
+        -H "X-Rel: $[p.rel]" \
+        --data-binary "@${_tarball}")
+    rm -f $_resp_tmp
+    if (_code !== '201') {
+        war $pkg "Source upload failed (HTTP $_code)"
+        return
+    }
+    log $pkg "Source uploaded"
+}
+
+proc pkg_source_cmd (...pkgs) {
+    ### Download, process, pack, and upload source tarballs without building.
+    ### Use this to backfill the source mirror for existing packages.
+    if (KOMINKA_REPO === '') { die "KOMINKA_REPO not set" }
+
+    var _token = ''
+    auth_token_load (&_token)
+    if (_token === '') { die "Not authenticated — set KOMINKA_TOKEN or run 'pm auth'" }
+
+    index_refresh
+
+    var p = null
+    for pkg in (pkgs) {
+        pkg_find_and_load $pkg (&p)
+
+        if (len(p.sources) === 0) {
+            log $pkg "Metapackage — skipping"
+            continue
+        }
+
+        # Skip if already mirrored at this exact ver-rel.
+        index_load
+        if (pkg in _remote_index) {
+            var _ri = _remote_index[pkg]
+            var _src_sha = _ri => get('src_sha256', '')
+            if (_src_sha !== '' and _ri['ver'] === p.ver and _ri['rel'] === p.rel) {
+                log $pkg "Already mirrored at $[p.ver]-$[p.rel]"
+                continue
+            }
+        }
+
+        pkg_source (p)
+        if (len(p.sources) > 0) { pkg_verify (p) }
+        pkg_extract (p)
+        pkg_git_strip (p)
+        pkg_source_process (p)
+        pkg_source_pack (p)
+        pkg_source_upload $pkg (p)
+    }
+}
+
 proc pkg_build_all (...pkgs) {
     ### Build packages and turn them into tarballs.
 
@@ -1683,12 +1811,19 @@ proc pkg_build_all (...pkgs) {
         call to_build->append(pkg)
     }
 
+    setglobal mirror_used = {}
+
     var p = null
     for pkg in (to_build) {
         pkg_find_and_load $pkg (&p)
-        pkg_source (p)
         if (len(p.sources) > 0) {
-            pkg_verify (p)
+            try { pkg_mirror_use (p) }
+            if ! failed {
+                setglobal mirror_used[pkg] = true
+            } else {
+                pkg_source (p)
+                pkg_verify (p)
+            }
         }
     }
 
@@ -1702,8 +1837,11 @@ proc pkg_build_all (...pkgs) {
 
         run_hook queue $pkg $build_cur $[len(to_build)]
 
-        if (len(p.sources) > 0) {
+        if (len(p.sources) > 0 and not (pkg in mirror_used)) {
             pkg_extract (p)
+            pkg_git_strip (p)
+            pkg_source_process (p)
+            pkg_source_pack (p)
         }
 
         pkg_build (p)
@@ -2627,7 +2765,7 @@ proc args (action='', ...pkgs) {
             }
         }
 
-        b | build | c | checksum | d | download | i | install | l | list | p | upload | r | remove | t | tree {
+        b | build | c | checksum | d | download | src | i | install | l | list | p | upload | r | remove | t | tree {
             for arg in (pkgs) {
                 var bad = ''
                 case (action) {
@@ -2674,8 +2812,8 @@ proc args (action='', ...pkgs) {
             # list here would mark implicit make-deps as "explicit", bypassing
             # the pre-built binary cache check.
             case (action) {
-                b | build { true }
-                *         { setvar pkgs = order }
+                b | build | src { true }
+                *               { setvar pkgs = order }
             }
         }
     }
@@ -2725,9 +2863,13 @@ proc args (action='', ...pkgs) {
             var p = null
             for pkg in (pkgs) {
                 pkg_find_and_load $pkg (&p)
-                pkg_source (p)
+                if (len(p.sources) > 0) {
+                    try { pkg_mirror_use (p) }
+                    if failed { pkg_source (p) }
+                }
             }
         }
+        src { pkg_source_cmd @pkgs }
         H | help-ext     { pkg_help_ext @pkgs }
         i | install      { pkg_install_all @pkgs }
         l | list         { pkg_list_version @pkgs }
@@ -2747,13 +2889,14 @@ proc args (action='', ...pkgs) {
             log 'auth         Authenticate with repository'
             log 'build        Build packages'
             log 'checksum     Generate checksums'
-            log 'download     Download sources'
+            log 'download     Download sources (prefers mirror)'
             log 'help         Show this message'
             log 'info         Show package details'
             log 'install      Install packages'
             log 'outdated     Show packages with newer versions available'
             log 'list         List installed packages'
             log 'remove       Remove packages'
+            log 'src          Mirror package sources (download, process, upload)'
             log 'upload       Upload packages to repository'
             log 'search       Search for packages'
             log 'tree         Show dependency tree'
@@ -2790,6 +2933,7 @@ proc create_tmp_dirs () {
     setglobal src_dir = "${cac_dir}/sources"
     setglobal log_dir = "${cac_dir}/logs/${time_str%-*}"
     setglobal bin_dir = "${cac_dir}/bin"
+    setglobal mir_dir = "${cac_dir}/src"
 
     # Temporary cache directories.
     setglobal proc_dir = "${KOMINKA_TMPDIR:-"${cac_dir}/proc"}"
@@ -2800,7 +2944,7 @@ proc create_tmp_dirs () {
     setglobal tar_dir = "${proc_dir}/extract"
     setglobal tmp_dir = "${proc_dir}/tmp"
 
-    mkdir -p $src_dir $log_dir $bin_dir \
+    mkdir -p $src_dir $log_dir $bin_dir $mir_dir \
              $mak_dir $pkg_dir $tar_dir $tmp_dir
 }
 
@@ -2838,7 +2982,6 @@ proc main (...argv) {
     setglobal KOMINKA_ELF       = ENV => get("KOMINKA_ELF", "")
     setglobal KOMINKA_CHK       = ENV => get("KOMINKA_CHK", "")
     setglobal KOMINKA_GET       = ENV => get("KOMINKA_GET", "")
-    setglobal KOMINKA_MIRROR      = ENV => get("KOMINKA_MIRROR", "")
     setglobal KOMINKA_BIN_MIRROR  = ENV => get("KOMINKA_BIN_MIRROR", "")
     setglobal KOMINKA_REPO        = ENV => get("KOMINKA_REPO", "")
     setglobal KOMINKA_TOKEN       = ENV => get("KOMINKA_TOKEN", "")
@@ -2906,7 +3049,6 @@ proc main (...argv) {
     setglobal config = {
         root:       KOMINKA_ROOT,
         path:       KOMINKA_PATH,
-        mirror:     KOMINKA_MIRROR,
         repo:       KOMINKA_REPO,
         compress:   KOMINKA_COMPRESS,
         arch:       sys_arch,

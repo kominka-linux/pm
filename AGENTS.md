@@ -53,10 +53,30 @@ Two paths depending on tarball size:
 - **< 50 MB**: `POST /api/upload` with the tarball body; server returns `{"ok":true,"sha256":"..."}`
 - **≥ 50 MB** (Cloudflare proxy limit): `POST /api/upload-url` → `PUT` directly to R2 → `POST /api/update-index` with `X-Sha256`
 
+### Upload flow (`pkg_upload`, line ~706)
+
+Two paths depending on tarball size:
+
+- **< 50 MB**: `POST /api/upload` with the tarball body; server returns `{"ok":true,"sha256":"..."}`
+- **≥ 50 MB** (Cloudflare proxy limit): `POST /api/upload-url` → `PUT` directly to R2 → `POST /api/update-index` with `X-Sha256`
+
+After the binary upload, `pkg_upload` also calls `pkg_source_upload` to upload the source tarball if one is cached.
+
+### Source mirror flow
+
+Every `pm b` that uses upstream sources (not the mirror) runs this sequence after `pkg_extract`:
+
+1. `pkg_git_strip` — removes all `.git/` directories
+2. `pkg_source_process` — calls `process(src)` from PKGBUILD.ysh if defined
+3. `pkg_source_pack` — packs `mak_dir/{pkg}/` as `~/.cache/kominka/src/{pkg}@{ver}-{rel}.tar.bz2` (always bzip2)
+
+When the remote index has `src_sha256` for the current ver-rel, `pm b` downloads the mirror tarball instead of individual upstream sources, skipping steps 1–3.
+
 ### Storage
 
 ```
 ~/.cache/kominka/bin/           Binary cache: pkg@ver-rel.tar.gz
+~/.cache/kominka/src/           Processed source cache: pkg@ver-rel.tar.bz2
 ~/.cache/kominka/packages.json  Cached package index (per arch)
 /var/db/kominka/installed/{pkg}/
   version                       "ver rel"  (or "system 1" for pre-installed)
@@ -99,9 +119,17 @@ proc build(dest) {
 
 **Arch-specific checksums**: use `checksums_aarch64` or `checksums_x86_64` to override `checksums` for a specific arch.
 
-**Metapackages**: set `sources = []` and have `build` do nothing (`true`). The `deps` list carries all meaning.
+**Metapackages**: set `sources = []` and have `build` do nothing (`true`). The `deps` list carries all meaning. Metapackages are skipped by `pm src`.
 
 **`nostrip`**: set `var nostrip = true` to skip binary stripping (needed for Go, Rust, and packages with split debug info).
+
+**`process(src)`**: optional proc to strip unnecessary files from the source tree before it is packed and mirrored. Called after extraction and `.git` removal, before `build`. CWD is set to `src`; use relative paths freely.
+
+```ysh
+proc process(src) {
+    rm -rf $src/test $src/fuzz $src/third_party/googletest
+}
+```
 
 ### PKGBUILD conventions
 
@@ -116,11 +144,13 @@ proc build(dest) {
 ### Data model (`packages.rs`)
 
 ```rust
-PackageEntry { ver, rel, deps: Vec<String>, mkdeps: Vec<String>, sha256 }
+PackageEntry { ver, rel, deps: Vec<String>, mkdeps: Vec<String>, sha256, src_sha256: Option<String> }
 PackageIndex { _version: 1, packages: HashMap<name, PackageEntry> }
 ```
 
-The index lives in S3 at `{arch}/packages.json`. Tarballs live at `{arch}/{pkg}/{ver}-{rel}.tar.gz`.
+The index lives in S3 at `{arch}/packages.json`. Binary tarballs at `{arch}/{pkg}/{ver}-{rel}.tar.gz`. Source tarballs at `src/{pkg}/{ver}-{rel}.tar.bz2` (arch-independent).
+
+`src_sha256` is omitted from JSON when `None`, so existing index entries are unaffected. It is set by `POST /api/upload-src` and signals that a source mirror exists for that ver-rel.
 
 ### Endpoints
 
@@ -129,7 +159,8 @@ The index lives in S3 at `{arch}/packages.json`. Tarballs live at `{arch}/{pkg}/
 | Path | Description |
 |------|-------------|
 | `/{arch}/packages.json` | Package index (in-memory, served from `state.indexes`) |
-| `/{arch}/{pkg}/{ver}-{rel}.tar.gz` | Tarball; 302→R2 if `R2_PUBLIC_URL` configured |
+| `/{arch}/{pkg}/{ver}-{rel}.tar.gz` | Binary tarball; 302→R2 if `R2_PUBLIC_URL` configured |
+| `/src/{pkg}/{ver}-{rel}.tar.bz2` | Source tarball; 302→R2 if `R2_PUBLIC_URL` configured |
 | `/health` | `{"status":"ok"}` |
 
 **POST** (all require `Authorization: Bearer <token>` or session cookie)
@@ -137,6 +168,7 @@ The index lives in S3 at `{arch}/packages.json`. Tarballs live at `{arch}/{pkg}/
 | Path | Headers | Body | Returns |
 |------|---------|------|---------|
 | `/api/upload` | X-Arch, X-Pkg, X-Ver, X-Rel, X-Deps, X-Mkdeps | binary tarball | `{"ok":true,"sha256":"..."}` 201 |
+| `/api/upload-src` | X-Pkg, X-Ver, X-Rel | source `.tar.bz2` | `{"ok":true}` 201 — sets `src_sha256` in index |
 | `/api/upload-url` | X-Arch, X-Pkg, X-Ver, X-Rel | — | `{"url":"..."}` 200 |
 | `/api/update-index` | X-Arch, X-Pkg, X-Ver, X-Rel, X-Sha256, X-Deps, X-Mkdeps | — | `{"ok":true}` 201 |
 | `/api/publish` | — | `{arch,pkg,ver,rel,deps,mkdeps}` JSON | `{"ok":true}` 201 — metapackages |
@@ -182,14 +214,27 @@ if failed { die "msg" }
 
 **Backslash in expression context** — `var x = '\n'` is OILS-ERR-20. Use `u'\n'` (J8) or `$[newline]`.
 
+**Literal `@` in command arguments** — bare `@` at the start of a word is a splice operator (`parse_at_all`). To pass a literal `@` to a command (e.g. curl's `--data-binary @file`), quote it: `"@${file}"` or `'@'$file`.
+
 ## Common tasks
 
 ### Add a new package
 
 1. Create `packages/{name}/PKGBUILD.ysh` with the fields above.
 2. Run `pm c {name}` to generate checksums (or paste them from the upstream release page).
-3. Test with `pm b {name}` — the build runs in a temp dir, staging to a `dest/` prefix.
-4. Upload with `pm p {name}` (requires auth token).
+3. Add `proc process(src)` if the upstream has large test/benchmark dirs worth stripping.
+4. Test with `pm b {name}` — the build runs in a temp dir, staging to a `dest/` prefix.
+5. Upload with `pm p {name}` (requires auth token). This uploads both the binary and the processed source tarball.
+
+### Backfill source mirrors
+
+For packages already in the repo that predate source mirroring:
+
+```
+pm src pkg1 pkg2 pkg3 ...
+```
+
+Downloads upstream sources, strips `.git/`, runs `process()` if defined, packs, and uploads. Skips packages already mirrored at the current ver-rel.
 
 ### Bump a package version
 
